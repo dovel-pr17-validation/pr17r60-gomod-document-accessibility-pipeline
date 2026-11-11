@@ -1,0 +1,822 @@
+package cloudtools
+
+import (
+	"archive/tar"
+	"bytes"
+	"compress/gzip"
+	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
+	"fmt"
+	"net/http"
+	"net/http/httptest"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"regexp"
+	"runtime"
+	"strings"
+	"sync/atomic"
+	"testing"
+	"time"
+)
+
+func TestBootstrapChecksChecksumBeforeInstallAndCleansTemporaryFiles(t *testing.T) {
+	body := []byte("#!/bin/sh\necho testtool 1.2.3\n")
+	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { _, _ = w.Write(body) }))
+	defer server.Close()
+	m := testManifest(server.URL+"/tool", strings.Repeat("0", 64), "raw")
+	root, cache := filepath.Join(t.TempDir(), "tools"), filepath.Join(t.TempDir(), "cache")
+	err := Bootstrap(context.Background(), m, Options{Root: root, Cache: cache, GoBinary: os.Args[0], Client: server.Client(), LockWait: time.Second})
+	if err == nil || !strings.Contains(err.Error(), "SHA-256 mismatch") {
+		t.Fatalf("Bootstrap error = %v; want checksum failure", err)
+	}
+	if _, err := os.Stat(filepath.Join(root, "bin", "fixture")); !os.IsNotExist(err) {
+		t.Fatalf("binary exists after failed checksum: %v", err)
+	}
+	if entries, _ := filepath.Glob(filepath.Join(cache, "downloads", ".download-*")); len(entries) != 0 {
+		t.Fatalf("temporary downloads remain: %v", entries)
+	}
+}
+
+func TestBootstrapIsIdempotentAndVerifiesVersion(t *testing.T) {
+	body := []byte("#!/bin/sh\necho testtool 1.2.3\n")
+	digest := sha256.Sum256(body)
+	var requests atomic.Int32
+	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { requests.Add(1); _, _ = w.Write(body) }))
+	defer server.Close()
+	m := testManifest(server.URL+"/tool", hex.EncodeToString(digest[:]), "raw")
+	root, cache := filepath.Join(t.TempDir(), "tools"), filepath.Join(t.TempDir(), "cache")
+	o := Options{Root: root, Cache: cache, GoBinary: os.Args[0], Client: server.Client(), LockWait: time.Second}
+	for i := 0; i < 2; i++ {
+		if err := Bootstrap(context.Background(), m, o); err != nil {
+			t.Fatalf("run %d: %v", i+1, err)
+		}
+	}
+	if requests.Load() != 1 {
+		t.Fatalf("asset requests = %d; want one for two runs", requests.Load())
+	}
+	if _, err := os.Stat(filepath.Join(root, "activate.sh")); err != nil {
+		t.Fatalf("activation file missing: %v", err)
+	}
+	got, err := os.ReadFile(filepath.Join(root, "bin", "fixture"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got, body) {
+		t.Fatalf("installed bytes changed: %q", got)
+	}
+}
+
+func TestBootstrapRejectsWrongCLIVersionEvenWithCorrectChecksum(t *testing.T) {
+	body := []byte("#!/bin/sh\necho testtool 9.9.9\n")
+	digest := sha256.Sum256(body)
+	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { _, _ = w.Write(body) }))
+	defer server.Close()
+	m := testManifest(server.URL+"/tool", hex.EncodeToString(digest[:]), "raw")
+	root := filepath.Join(t.TempDir(), "tools")
+	err := Bootstrap(context.Background(), m, Options{Root: root, Cache: filepath.Join(t.TempDir(), "cache"), GoBinary: os.Args[0], Client: server.Client(), LockWait: time.Second})
+	if err == nil || !strings.Contains(err.Error(), "version validation") {
+		t.Fatalf("Bootstrap error = %v; want version check failure", err)
+	}
+	if _, err := os.Stat(filepath.Join(root, "bin", "fixture")); !os.IsNotExist(err) {
+		t.Fatalf("wrong-version binary was published: %v", err)
+	}
+}
+
+func TestVerifyInstalledValidatesEveryManifestToolEntry(t *testing.T) {
+	fixture := []byte("#!/bin/sh\necho fixture 1.2.3\n")
+	wrongVersion := []byte("#!/bin/sh\necho wrong-version 9.9.9\n")
+	checksumBody := []byte("#!/bin/sh\necho checksum 3.0.0\n")
+	wrongChecksumPin := sha256.Sum256([]byte("different pinned bytes"))
+
+	makeTool := func(name, version string, body, pinnedDigest []byte) Tool {
+		actualDigest := sha256.Sum256(body)
+		if pinnedDigest == nil {
+			pinnedDigest = actualDigest[:]
+		}
+		tool := testManifest("https://example.invalid/"+name, hex.EncodeToString(pinnedDigest), "raw").Tools[0]
+		tool.Name = name
+		tool.Version = version
+		tool.Binary = name
+		tool.BinarySHA256 = hex.EncodeToString(pinnedDigest)
+		tool.VersionPattern = regexp.QuoteMeta(name + " " + version)
+		return tool
+	}
+
+	tools := []Tool{
+		makeTool("fixture", "1.2.3", fixture, nil),
+		makeTool("wrong-version", "2.0.0", wrongVersion, nil),
+		makeTool("checksum", "3.0.0", checksumBody, wrongChecksumPin[:]),
+	}
+	root := filepath.Join(t.TempDir(), "tools")
+	binDir := filepath.Join(root, "bin")
+	if err := os.MkdirAll(binDir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	for name, body := range map[string][]byte{
+		"fixture":       fixture,
+		"wrong-version": wrongVersion,
+		"checksum":      checksumBody,
+	} {
+		if err := os.WriteFile(filepath.Join(binDir, name), body, 0700); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	m := Manifest{
+		SchemaVersion:   1,
+		Platform:        runtime.GOOS + "/" + runtime.GOARCH,
+		BootstrapSource: testBootstrapSource(),
+		Tools:           tools,
+	}
+	results, err := VerifyInstalled(context.Background(), m, Options{Root: root, GoBinary: os.Args[0]})
+	if err != nil {
+		t.Fatalf("VerifyInstalled: %v", err)
+	}
+	if len(results) != len(tools) {
+		t.Fatalf("verification returned %d entries, want %d: %#v", len(results), len(tools), results)
+	}
+	if results[0].Name != "fixture" || !results[0].OK {
+		t.Errorf("first manifest entry = %#v, want valid fixture", results[0])
+	}
+	if results[1].Name != "wrong-version" || results[1].OK || !strings.Contains(results[1].Status, "pinned version") {
+		t.Errorf("second manifest entry = %#v, want matching-digest wrong-version rejection", results[1])
+	}
+	if results[2].Name != "checksum" || results[2].OK || !strings.Contains(results[2].Status, "digest") {
+		t.Errorf("third manifest entry = %#v, want checksum rejection", results[2])
+	}
+}
+
+func TestBlockedRepairDoesNotReportPreexistingWrongVersionAsVerified(t *testing.T) {
+	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusForbidden) }))
+	defer server.Close()
+	root := filepath.Join(t.TempDir(), "tools")
+	if err := os.MkdirAll(filepath.Join(root, "bin"), 0700); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(root, "bin", "fixture")
+	if err := os.WriteFile(path, []byte("#!/bin/sh\necho testtool 9.9.9\n"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	if out, err := exec.Command(path, "--version").CombinedOutput(); err != nil || strings.TrimSpace(string(out)) != "testtool 9.9.9" {
+		t.Fatalf("wrong-version fixture did not execute as intended: output=%q err=%v", out, err)
+	}
+	m := testManifest(server.URL+"/fixture", strings.Repeat("a", 64), "raw")
+	o := Options{Root: root, Cache: filepath.Join(t.TempDir(), "cache"), GoBinary: os.Args[0], Client: server.Client(), LockWait: time.Second}
+	if err := Bootstrap(context.Background(), m, o); err == nil {
+		t.Fatal("expected blocked repair download")
+	}
+	results, err := VerifyInstalled(context.Background(), m, o)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(results) != 1 || results[0].OK || results[0].Path != path || !strings.Contains(results[0].Status, "invalid") {
+		t.Fatalf("wrong-version executable was reported ready: %#v", results)
+	}
+}
+
+func TestTarExtractionRequiresSafeRegularMember(t *testing.T) {
+	makeArchive := func(name string, typ byte) string {
+		path := filepath.Join(t.TempDir(), "asset.tgz")
+		f, err := os.Create(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		gz := gzip.NewWriter(f)
+		tw := tar.NewWriter(gz)
+		size := int64(0)
+		if typ == tar.TypeReg {
+			size = 3
+		}
+		h := &tar.Header{Name: name, Mode: 0755, Size: size, Typeflag: typ}
+		if err := tw.WriteHeader(h); err != nil {
+			t.Fatal(err)
+		}
+		if typ == tar.TypeReg {
+			_, _ = tw.Write([]byte("abc"))
+		}
+		_ = tw.Close()
+		_ = gz.Close()
+		_ = f.Close()
+		return path
+	}
+	if err := extractTarBinary(makeArchive("../escape", tar.TypeReg), "escape", filepath.Join(t.TempDir(), "out")); err == nil {
+		t.Fatal("accepted traversal path")
+	}
+	if err := extractTarBinary(makeArchive("link", tar.TypeSymlink), "link", filepath.Join(t.TempDir(), "out")); err == nil {
+		t.Fatal("accepted symlink member")
+	}
+	got := filepath.Join(t.TempDir(), "out")
+	if err := extractTarBinary(makeArchive("sub/tool", tar.TypeReg), "tool", got); err != nil {
+		t.Fatal(err)
+	}
+	contents, err := os.ReadFile(got)
+	if err != nil || string(contents) != "abc" {
+		t.Fatalf("extracted contents = %q, %v", contents, err)
+	}
+}
+
+func TestConcurrentBootstrapTimesOutOnOwnedLock(t *testing.T) {
+	root := t.TempDir()
+	lock := filepath.Join(root, ".bootstrap.lock")
+	if err := os.Mkdir(lock, 0700); err != nil {
+		t.Fatal(err)
+	}
+	start := time.Now()
+	_, err := acquireLock(context.Background(), lock, 50*time.Millisecond)
+	if err == nil || !strings.Contains(err.Error(), "timed out") {
+		t.Fatalf("lock error = %v", err)
+	}
+	if time.Since(start) < 40*time.Millisecond {
+		t.Fatal("lock wait returned before timeout")
+	}
+	if _, err := os.Stat(lock); err != nil {
+		t.Fatal("waiter removed lock owned by another process")
+	}
+}
+
+func TestCommandCancellationKillsDescendantHoldingCombinedOutputPipe(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	ready := filepath.Join(t.TempDir(), "child-started")
+	cmd := commandContext(ctx, "sh", "-c", `sleep 1 & echo ready > "$1"; wait`, "sh", ready)
+	done := make(chan error, 1)
+	go func() {
+		_, err := cmd.CombinedOutput()
+		done <- err
+	}()
+	deadline := time.Now().Add(time.Second)
+	for {
+		if _, err := os.Stat(ready); err == nil {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("descendant did not start")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	started := time.Now()
+	cancel()
+	select {
+	case <-done:
+		if time.Since(started) > 500*time.Millisecond {
+			t.Fatalf("cancellation waited for descendant-held pipe: %s", time.Since(started))
+		}
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("command did not return promptly after cancellation")
+	}
+}
+
+func TestActivationCanBeSourcedRepeatedlyWithoutChangingPATHAgain(t *testing.T) {
+	root := t.TempDir()
+	for _, dir := range []string{"bin", "toolchains/go/" + pinnedGoVersion(t) + "/bin"} {
+		if err := os.MkdirAll(filepath.Join(root, dir), 0700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	activation := filepath.Join(root, "activate.sh")
+	goBinary := fakeGoToolchainBinary(t, root)
+	if err := writeActivation(activation, goBinary); err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(activation)
+	if err != nil || strings.Contains(string(data), "VERAPDF_") {
+		t.Fatalf("shared Go activation exposed the isolated validator: %s, %v", data, err)
+	}
+	cmd := exec.Command("bash", "-c", `source "$1"; first=$PATH; source "$1"; test "$PATH" = "$first"`, "bash", activation)
+	cmd.Env = append(os.Environ(), "PATH=/usr/bin:/bin")
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("activation failed or duplicated PATH: %s %v", out, err)
+	}
+}
+
+func TestWriteGoLauncherDoesNotOverwriteUnmanagedFile(t *testing.T) {
+	root := t.TempDir()
+	goBinary := filepath.Join(root, "selected Go's path", "go1.28")
+	if err := os.MkdirAll(filepath.Dir(goBinary), 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(goBinary, []byte("#!/bin/sh\nexit 0\n"), 0700); err != nil {
+		t.Fatal(err)
+	}
+	launcherDir := filepath.Join(root, ".activation", "bin")
+	if err := os.MkdirAll(launcherDir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	launcherPath := filepath.Join(launcherDir, "go")
+	unmanaged := []byte("#!/bin/sh\nexit 99\n")
+	if err := os.WriteFile(launcherPath, unmanaged, 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := writeGoLauncher(launcherPath, goBinary); err == nil {
+		t.Fatal("accepted an unrelated file at the bootstrap-owned launcher path")
+	}
+	got, err := os.ReadFile(launcherPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != string(unmanaged) {
+		t.Fatalf("unmanaged launcher contents were overwritten: %q", got)
+	}
+}
+
+func TestWriteGoLauncherRejectsActivationDirectorySymlink(t *testing.T) {
+	root := t.TempDir()
+	goBinary := filepath.Join(root, "selected-go", "go1.28")
+	if err := os.MkdirAll(filepath.Dir(goBinary), 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(goBinary, []byte("#!/bin/sh\nexit 0\n"), 0700); err != nil {
+		t.Fatal(err)
+	}
+	outside := filepath.Join(root, "outside")
+	if err := os.Mkdir(outside, 0700); err != nil {
+		t.Fatal(err)
+	}
+	activationDir := filepath.Join(root, ".activation")
+	if err := os.Symlink(outside, activationDir); err != nil {
+		t.Skipf("symlink fixture unavailable: %v", err)
+	}
+	launcherPath := filepath.Join(activationDir, "bin", "go")
+	if err := writeGoLauncher(launcherPath, goBinary); err == nil {
+		t.Fatal("followed an activation-directory symlink")
+	}
+	if _, err := os.Lstat(filepath.Join(outside, "bin")); !os.IsNotExist(err) {
+		t.Fatalf("activation wrote through the symlink: %v", err)
+	}
+}
+
+func TestWriteGoLauncherRejectsSymlinkSelectedBinary(t *testing.T) {
+	root := t.TempDir()
+	selectedDir := filepath.Join(root, "selected")
+	if err := os.Mkdir(selectedDir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	actualGo := filepath.Join(selectedDir, "go-real")
+	if err := os.WriteFile(actualGo, []byte("#!/bin/sh\nexit 0\n"), 0700); err != nil {
+		t.Fatal(err)
+	}
+	selectedGo := filepath.Join(selectedDir, "go1.28")
+	if err := os.Symlink(actualGo, selectedGo); err != nil {
+		t.Skipf("symlink fixture unavailable: %v", err)
+	}
+	launcher := filepath.Join(root, ".activation", "bin", "go")
+	if err := writeGoLauncher(launcher, selectedGo); err == nil {
+		t.Fatal("accepted a symlink as the selected Go executable")
+	}
+	if _, err := os.Lstat(filepath.Join(root, ".activation")); !os.IsNotExist(err) {
+		t.Fatalf("activation directory was published for a symlink selection: %v", err)
+	}
+}
+
+type cancelOnWrite struct{ cancel context.CancelFunc }
+
+func (w cancelOnWrite) Write(p []byte) (int, error) {
+	w.cancel()
+	return len(p), nil
+}
+
+func TestBootstrapCancellationDoesNotPublishGoLauncher(t *testing.T) {
+	temp := t.TempDir()
+	goBinary := filepath.Join(temp, "go1.28")
+	if err := os.WriteFile(goBinary, []byte("#!/bin/sh\necho testtool 1.2.3\n"), 0700); err != nil {
+		t.Fatal(err)
+	}
+	manifest := testManifest("https://example.invalid/not-used", strings.Repeat("a", 64), "raw")
+	manifest.Tools[0].Name = "go"
+	manifest.Tools[0].Kind = "bootstrap-toolchain"
+	manifest.Tools[0].Source = "https://go.dev/dl/go1.2.3.linux-amd64.tar.gz"
+	manifest.Tools[0].ChecksumSource = "https://go.dev/dl/"
+	root := filepath.Join(temp, "tools")
+	ctx, cancel := context.WithCancel(context.Background())
+	err := Bootstrap(ctx, manifest, Options{
+		Root: root, Cache: filepath.Join(temp, "cache"), GoBinary: goBinary,
+		Output: cancelOnWrite{cancel: cancel}, LockWait: time.Second,
+	})
+	if err == nil || !strings.Contains(err.Error(), "canceled") {
+		t.Fatalf("Bootstrap error = %v; want cancellation after validation", err)
+	}
+	for _, path := range []string{filepath.Join(root, "activate.sh"), filepath.Join(root, ".activation", "bin", "go")} {
+		if _, err := os.Lstat(path); !os.IsNotExist(err) {
+			t.Errorf("canceled bootstrap published %s: %v", path, err)
+		}
+	}
+}
+
+func TestCloudBootstrapEntryPointRejectsUnexpectedArgsBeforeWrites(t *testing.T) {
+	temp := t.TempDir()
+	entrypoint, err := filepath.Abs(filepath.Join("..", "..", "..", "..", "scripts", "bootstrap-cloud-build-tools.sh"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	toolsRoot := filepath.Join(temp, "canonical-tools-root")
+	cacheRoot := filepath.Join(temp, "canonical-cache-root")
+	fakeBin := filepath.Join(temp, "bin")
+	if err := os.Mkdir(fakeBin, 0700); err != nil {
+		t.Fatal(err)
+	}
+	sideEffectMarker := filepath.Join(temp, "filesystem-command-called")
+	fakeMkdir := "#!/bin/sh\nprintf called > \"$SIDE_EFFECT_MARKER\"\nexit 1\n"
+	if err := os.WriteFile(filepath.Join(fakeBin, "mkdir"), []byte(fakeMkdir), 0700); err != nil {
+		t.Fatal(err)
+	}
+	cmd := exec.Command("bash", entrypoint, "--root", filepath.Join(temp, "requested-root"))
+	cmd.Env = append(os.Environ(),
+		"CODEX_BUILD_TOOLS_ROOT="+toolsRoot,
+		"CODEX_BUILD_CACHE_ROOT="+cacheRoot,
+		"SIDE_EFFECT_MARKER="+sideEffectMarker,
+		"PATH="+fakeBin+":"+os.Getenv("PATH"),
+	)
+	out, runErr := cmd.CombinedOutput()
+	if runErr == nil || !strings.Contains(string(out), "does not accept command-line arguments") {
+		t.Fatalf("unsupported CLI arguments were not rejected immediately: output=%q err=%v", out, runErr)
+	}
+	if _, err := os.Stat(sideEffectMarker); !os.IsNotExist(err) {
+		t.Fatalf("entrypoint ran a filesystem command before rejecting arguments: %v", err)
+	}
+	for _, path := range []string{toolsRoot, cacheRoot, filepath.Join(temp, "requested-root")} {
+		if _, err := os.Lstat(path); !os.IsNotExist(err) {
+			t.Fatalf("unsupported argument changed or created root %s: %v", path, err)
+		}
+	}
+}
+
+func testManifest(url, sha, kind string) Manifest {
+	return Manifest{SchemaVersion: 1, Platform: "linux/amd64", BootstrapSource: testBootstrapSource(), Tools: []Tool{{Name: "fixture", Version: "1.2.3", License: "MIT", Source: url, SHA256: sha, ChecksumSource: "fixture server", Kind: kind, Binary: "fixture", VersionArgs: []string{"--version"}, VersionPattern: `testtool 1\.2\.3`}}}
+}
+
+func testBootstrapSource() BootstrapSource {
+	revision := "0123456789abcdef0123456789abcdef01234567"
+	storageRevision := "abcdef0123456789abcdef0123456789abcdef01"
+	path := "buildtools/source-archives/cloud-tools-bootstrap-" + revision + ".tar.gz"
+	url := "https://raw.githubusercontent.com/pratik-saptarshi/document-accessibility-pipeline/" + storageRevision + "/" + path
+	return BootstrapSource{Revision: revision, StorageRevision: storageRevision, Path: path, URL: url, SHA256: strings.Repeat("c", 64), SizeBytes: 42}
+}
+
+func TestManifestErrorTextDoesNotIncludeURLQuery(t *testing.T) {
+	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(http.StatusForbidden) }))
+	defer server.Close()
+	m := testManifest(server.URL+"/tool?credential=synthetic", strings.Repeat("a", 64), "raw")
+	err := Bootstrap(context.Background(), m, Options{Root: filepath.Join(t.TempDir(), "tools"), Cache: filepath.Join(t.TempDir(), "cache"), GoBinary: os.Args[0], Client: server.Client(), LockWait: time.Second})
+	if err == nil || strings.Contains(err.Error(), "credential") {
+		t.Fatalf("unexpected error leakage: %v", err)
+	}
+}
+
+func TestEveryConfiguredVersionPatternRejectsLongerNumericPrefix(t *testing.T) {
+	f, err := os.Open("../../../../buildtools.manifest.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+	m, err := DecodeManifest(f)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, tool := range m.Tools {
+		if tool.VersionPattern == "" {
+			continue
+		}
+		p := regexp.MustCompile(tool.VersionPattern)
+		good := "tool version " + tool.Version
+		bad := "tool 1" + tool.Version
+		if tool.Name == "go" {
+			good = "go" + tool.Version
+			bad = "go1" + tool.Version
+		}
+		if !p.MatchString(good) {
+			t.Errorf("%s configured pattern rejects expected version output %q", tool.Name, good)
+		}
+		if p.MatchString(bad) {
+			t.Errorf("%s configured pattern accepts longer numeric prefix %q", tool.Name, bad)
+		}
+	}
+}
+
+func TestGoBuildInfoVersionFallbackRequiresExactModuleAndVersion(t *testing.T) {
+	good := "path github.com/google/go-licenses/v2\nmod github.com/google/go-licenses/v2 v2.0.1 h1:synthetic\n"
+	if !matchesModuleVersion(good, "github.com/google/go-licenses/v2", "2.0.1") {
+		t.Fatal("did not recognize exact module version")
+	}
+	for _, bad := range []string{
+		"mod github.com/google/go-licenses/v2 v2.0.10 h1:synthetic\n",
+		"mod github.com/other/tool v2.0.1 h1:synthetic\n",
+		"dep github.com/google/go-licenses/v2 v2.0.1 h1:synthetic\n",
+	} {
+		if matchesModuleVersion(bad, "github.com/google/go-licenses/v2", "2.0.1") {
+			t.Errorf("accepted build metadata %q", bad)
+		}
+	}
+}
+
+func TestInstalledOKRejectsOversizedVersionEvidence(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "fixture")
+	script := "#!/bin/sh\nprintf 'testtool 1.2.3\\n'\nprintf 'GOPROXY=https://proxy.synthetic.invalid/output?token=synthetic-marker\\n' >&2\nhead -c 65537 /dev/zero >&2\n"
+	if err := os.WriteFile(path, []byte(script), 0700); err != nil {
+		t.Fatal(err)
+	}
+	tool := Tool{
+		Name:           "fixture",
+		Version:        "1.2.3",
+		VersionArgs:    []string{"--version"},
+		VersionPattern: `testtool 1\.2\.3`,
+	}
+	ok, reason := installedOK(context.Background(), tool, path, Options{})
+	if ok {
+		t.Fatal("accepted version evidence from output larger than the capture limit")
+	}
+	if !strings.Contains(reason, "capture limit") {
+		t.Fatal("truncated version evidence did not fail with a bounded-output reason")
+	}
+	if strings.Contains(reason, "proxy.synthetic.invalid") || strings.Contains(reason, "synthetic-marker") {
+		t.Fatal("truncated version diagnostic exposed child output")
+	}
+}
+
+func TestInstalledOKRejectsOversizedFallbackVersionEvidence(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "fixture")
+	primary := "#!/bin/sh\nprintf 'unrecognized version\\n'\n"
+	if err := os.WriteFile(path, []byte(primary), 0700); err != nil {
+		t.Fatal(err)
+	}
+	goBinary := filepath.Join(t.TempDir(), "go")
+	fallback := "#!/bin/sh\nprintf 'mod example.invalid/tool v1.2.3 h1:synthetic\\n'\nprintf 'GOAUTH=synthetic-child-secret\\n' >&2\nhead -c 65537 /dev/zero >&2\n"
+	if err := os.WriteFile(goBinary, []byte(fallback), 0700); err != nil {
+		t.Fatal(err)
+	}
+	tool := Tool{
+		Name:            "fixture",
+		Module:          "example.invalid/tool@v1.2.3",
+		Version:         "1.2.3",
+		VersionArgs:     []string{"--version"},
+		VersionPattern:  `testtool 1\.2\.3`,
+		VersionFallback: "go version -m binary module version",
+	}
+	ok, reason := installedOK(context.Background(), tool, path, Options{GoBinary: goBinary})
+	if ok {
+		t.Fatal("accepted module version evidence from output larger than the capture limit")
+	}
+	if !strings.Contains(reason, "capture limit") {
+		t.Fatal("truncated fallback evidence did not fail with a bounded-output reason")
+	}
+	if strings.Contains(reason, "GOAUTH") || strings.Contains(reason, "synthetic-child-secret") {
+		t.Fatal("truncated fallback diagnostic exposed child output")
+	}
+}
+
+func TestBoundedOutputCapsFiniteWritesAndMarksTruncation(t *testing.T) {
+	const limit = 17
+	capture := newBoundedOutput(limit)
+	first := []byte("small-output")
+	second := bytes.Repeat([]byte("x"), 16)
+	if n, err := capture.Write(first); err != nil || n != len(first) {
+		t.Fatalf("first write = %d, %v", n, err)
+	}
+	if n, err := capture.Write(second); err != nil || n != len(second) {
+		t.Fatalf("second write = %d, %v", n, err)
+	}
+	data, truncated := capture.snapshot()
+	if len(data) != limit || !truncated || string(data) != "small-outputxxxxx" {
+		t.Fatal("bounded output did not preserve its prefix, enforce the cap, and record truncation")
+	}
+
+	small := newBoundedOutput(limit)
+	if _, err := small.Write([]byte("small-output")); err != nil {
+		t.Fatal("small write failed")
+	}
+	data, truncated = small.snapshot()
+	if string(data) != "small-output" || truncated {
+		t.Fatal("complete small output was not retained as untruncated evidence")
+	}
+}
+
+func TestInstallGoModuleDiscardsOutputAndPreservesExitClassification(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		exitStatus string
+		wantErr    bool
+	}{
+		{name: "success", exitStatus: "0"},
+		{name: "nonzero exit", exitStatus: "23", wantErr: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			fakeGo := filepath.Join(t.TempDir(), "go")
+			script := fmt.Sprintf("#!/bin/sh\nprintf 'CHILD_STDOUT_MARKER GOAUTH=synthetic-child-secret\\n'\nprintf 'GOPROXY=https://proxy.synthetic.invalid/output?token=synthetic-marker\\n' >&2\nexit %s\n", tc.exitStatus)
+			if err := os.WriteFile(fakeGo, []byte(script), 0700); err != nil {
+				t.Fatal(err)
+			}
+			err := installGoModule(context.Background(), Tool{Module: "example.invalid/tool@v1.2.3"}, t.TempDir(), Options{Cache: filepath.Join(t.TempDir(), "cache"), GoBinary: fakeGo})
+			if (err != nil) != tc.wantErr {
+				t.Fatal("module installation exit classification changed")
+			}
+			if err != nil {
+				if !strings.Contains(err.Error(), "exit status 23") {
+					t.Fatal("nonzero module installation lost its exit status")
+				}
+				if strings.Contains(err.Error(), "CHILD_STDOUT_MARKER") || strings.Contains(err.Error(), "proxy.synthetic.invalid") || strings.Contains(err.Error(), "synthetic-marker") || strings.Contains(err.Error(), "synthetic-child-secret") || strings.Contains(err.Error(), "GOAUTH") {
+					t.Fatal("module installation diagnostic exposed subprocess output")
+				}
+			}
+		})
+	}
+}
+
+func TestInstalledOKKeepsSmallVersionSuccessAndFailureClassification(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		exitStatus string
+		wantOK     bool
+	}{
+		{name: "successful version output", exitStatus: "0", wantOK: true},
+		{name: "nonzero exit despite matching output", exitStatus: "17", wantOK: false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "fixture")
+			script := fmt.Sprintf("#!/bin/sh\nprintf 'testtool 1.2.3\\n'\nprintf 'GOPROXY=https://proxy.synthetic.invalid/version?token=synthetic-marker\\n' >&2\nexit %s\n", tc.exitStatus)
+			if err := os.WriteFile(path, []byte(script), 0700); err != nil {
+				t.Fatal(err)
+			}
+			tool := Tool{Name: "fixture", Version: "1.2.3", VersionArgs: []string{"--version"}, VersionPattern: `testtool 1\.2\.3`}
+			ok, reason := installedOK(context.Background(), tool, path, Options{})
+			if ok != tc.wantOK {
+				t.Fatal("version command exit classification changed")
+			}
+			if strings.Contains(reason, "proxy.synthetic.invalid") || strings.Contains(reason, "synthetic-marker") {
+				t.Fatal("version diagnostic exposed subprocess output")
+			}
+		})
+	}
+}
+
+func TestInstalledOKKeepsSmallFallbackSuccessAndFailureClassification(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		exitStatus string
+		wantOK     bool
+	}{
+		{name: "successful module metadata", exitStatus: "0", wantOK: true},
+		{name: "nonzero metadata command", exitStatus: "19", wantOK: false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "fixture")
+			primary := "#!/bin/sh\nprintf 'unrecognized version\\n'\n"
+			if err := os.WriteFile(path, []byte(primary), 0700); err != nil {
+				t.Fatal(err)
+			}
+			goBinary := filepath.Join(t.TempDir(), "go")
+			fallback := fmt.Sprintf("#!/bin/sh\nprintf 'mod example.invalid/tool v1.2.3 h1:synthetic\\n'\nprintf 'CHILD_FALLBACK_MARKER\\n' >&2\nexit %s\n", tc.exitStatus)
+			if err := os.WriteFile(goBinary, []byte(fallback), 0700); err != nil {
+				t.Fatal(err)
+			}
+			tool := Tool{Name: "fixture", Module: "example.invalid/tool@v1.2.3", Version: "1.2.3", VersionArgs: []string{"--version"}, VersionPattern: `testtool 1\.2\.3`, VersionFallback: "go version -m binary module version"}
+			ok, reason := installedOK(context.Background(), tool, path, Options{GoBinary: goBinary})
+			if ok != tc.wantOK {
+				t.Fatal("fallback version command exit classification changed")
+			}
+			if strings.Contains(reason, "CHILD_FALLBACK_MARKER") {
+				t.Fatal("fallback version diagnostic exposed subprocess output")
+			}
+		})
+	}
+}
+
+func TestVerifyInstalledCancellationDuringVersionCommandRemainsCancellation(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("bootstrap cancellation group behavior is Linux-specific")
+	}
+	root := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(root, "bin"), 0700); err != nil {
+		t.Fatal(err)
+	}
+	started := filepath.Join(t.TempDir(), "started")
+	path := filepath.Join(root, "bin", "fixture")
+	script := fmt.Sprintf("#!/bin/sh\nprintf 'CHILD_CANCEL_MARKER\\n'\n: > %q\nsleep 30\n", started)
+	if err := os.WriteFile(path, []byte(script), 0700); err != nil {
+		t.Fatal(err)
+	}
+	m := testManifest("https://example.invalid/fixture", strings.Repeat("a", 64), "raw")
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() {
+		_, err := VerifyInstalled(ctx, m, Options{Root: root, GoBinary: os.Args[0]})
+		done <- err
+	}()
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		if _, err := os.Stat(started); err == nil {
+			break
+		}
+		if time.Now().After(deadline) {
+			cancel()
+			t.Fatal("version helper did not start")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	cancel()
+	select {
+	case err := <-done:
+		if err == nil || !strings.Contains(err.Error(), "verification canceled: context canceled") {
+			t.Fatal("version command cancellation lost its existing classification")
+		}
+		if strings.Contains(err.Error(), "CHILD_CANCEL_MARKER") {
+			t.Fatal("cancellation diagnostic exposed subprocess output")
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("version command did not return promptly after cancellation")
+	}
+}
+
+func TestInstallGoModuleUsesOfficialProxyAndChecksumDatabaseWithoutFallback(t *testing.T) {
+	capture := filepath.Join(t.TempDir(), "go-env")
+	fakeGo := filepath.Join(t.TempDir(), "go")
+	script := "#!/bin/sh\nprintf '%s\\n' \"$GOPROXY\" \"$GONOPROXY\" \"$GOSUMDB\" \"$GOPRIVATE\" \"$GONOSUMDB\" \"$GOINSECURE\" > \"$CAPTURE_ENV\"\n"
+	if err := os.WriteFile(fakeGo, []byte(script), 0700); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("CAPTURE_ENV", capture)
+	t.Setenv("GOPROXY", "direct")
+	t.Setenv("GONOPROXY", "*")
+	t.Setenv("GOSUMDB", "off")
+	t.Setenv("GOPRIVATE", "*")
+	t.Setenv("GONOSUMDB", "*")
+	t.Setenv("GOINSECURE", "*")
+	cache := filepath.Join(t.TempDir(), "cache")
+	if err := installGoModule(context.Background(), Tool{Module: "example.invalid/tool@v1.2.3"}, t.TempDir(), Options{Cache: cache, GoBinary: fakeGo}); err != nil {
+		t.Fatal(err)
+	}
+	got, err := os.ReadFile(capture)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := "https://proxy.golang.org\n\nsum.golang.org\n\n\n\n"
+	if string(got) != want {
+		t.Fatalf("module fetch policy environment = %q, want %q", got, want)
+	}
+}
+
+func TestInstallGoModuleIgnoresPersistedGoEnvProxyBypass(t *testing.T) {
+	goBinary := filepath.Join(runtime.GOROOT(), "bin", "go")
+	if _, err := os.Stat(goBinary); err != nil {
+		t.Fatalf("locate current Go toolchain: %v", err)
+	}
+	persisted := filepath.Join(t.TempDir(), "goenv")
+	content := "GONOPROXY=*\nGONOSUMDB=*\nGOPRIVATE=*\nGOINSECURE=*\n"
+	if err := os.WriteFile(persisted, []byte(content), 0600); err != nil {
+		t.Fatal(err)
+	}
+	capture := filepath.Join(t.TempDir(), "effective-go-env.json")
+	rawGoEnv := filepath.Join(t.TempDir(), "raw-goenv")
+	wrapper := filepath.Join(t.TempDir(), "go-wrapper")
+	script := "#!/bin/sh\nprintf '%s\\n' \"$GOENV\" > \"$CAPTURE_GOENV\"\n\"$REAL_GO\" env -json GOPROXY GONOPROXY GOSUMDB GOPRIVATE GONOSUMDB GOINSECURE > \"$CAPTURE_ENV\"\n"
+	if err := os.WriteFile(wrapper, []byte(script), 0700); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("GOENV", persisted)
+	t.Setenv("REAL_GO", goBinary)
+	t.Setenv("CAPTURE_ENV", capture)
+	t.Setenv("CAPTURE_GOENV", rawGoEnv)
+	t.Setenv("GOPROXY", "direct")
+	t.Setenv("GONOPROXY", "*")
+	t.Setenv("GOSUMDB", "off")
+	t.Setenv("GOPRIVATE", "*")
+	t.Setenv("GONOSUMDB", "*")
+	t.Setenv("GOINSECURE", "*")
+	if err := installGoModule(context.Background(), Tool{Module: "example.invalid/tool@v1.2.3"}, t.TempDir(), Options{Cache: filepath.Join(t.TempDir(), "cache"), GoBinary: wrapper}); err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(capture)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got struct {
+		GOPROXY    string
+		GONOPROXY  string
+		GOSUMDB    string
+		GOPRIVATE  string
+		GONOSUMDB  string
+		GOINSECURE string
+	}
+	if err := json.Unmarshal(data, &got); err != nil {
+		t.Fatalf("decode real Go environment: %v; data=%q", err, data)
+	}
+	want := struct {
+		GOPROXY    string
+		GONOPROXY  string
+		GOSUMDB    string
+		GOPRIVATE  string
+		GONOSUMDB  string
+		GOINSECURE string
+	}{GOPROXY: "https://proxy.golang.org", GOSUMDB: "sum.golang.org"}
+	if got != want {
+		t.Fatalf("real go env = %#v, want %#v", got, want)
+	}
+	raw, err := os.ReadFile(rawGoEnv)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(raw) != "off\n" {
+		t.Fatalf("install subprocess GOENV = %q, want off", raw)
+	}
+}

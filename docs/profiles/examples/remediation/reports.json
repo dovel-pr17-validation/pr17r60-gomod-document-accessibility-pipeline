@@ -1,0 +1,72 @@
+{
+  "schema_version": "1.1",
+  "status": "proposed",
+  "lane": "remediation",
+  "family": "reports",
+  "language": {
+    "value": "en",
+    "status": "open"
+  },
+  "confidentiality": {
+    "value": "synthetic example only; production classification open",
+    "status": "open"
+  },
+  "retention": {
+    "value": "policy and retention period open",
+    "status": "open"
+  },
+  "accessibility": {
+    "value": "PDF/UA-2 is the accepted target; semantic conformance and human review remain separately required",
+    "status": "open"
+  },
+  "human_review": {
+    "value": "semantic and assistive-technology protocol and authority open",
+    "status": "open"
+  },
+  "source_fields": [
+    {
+      "name": "sections",
+      "type": "unknown",
+      "status": "open"
+    },
+    {
+      "name": "tables",
+      "type": "unknown",
+      "status": "open"
+    },
+    {
+      "name": "figures",
+      "type": "unknown",
+      "status": "open"
+    },
+    {
+      "name": "provenance",
+      "type": "string",
+      "status": "open"
+    },
+    {
+      "name": "title",
+      "type": "string",
+      "status": "open"
+    },
+    {
+      "name": "report_date",
+      "type": "date",
+      "status": "open"
+    },
+    {
+      "name": "author",
+      "type": "string",
+      "status": "open"
+    },
+    {
+      "name": "footnotes",
+      "type": "string",
+      "status": "open"
+    }
+  ],
+  "pdfua_target": {
+    "value": "PDF/UA-2",
+    "status": "accepted"
+  }
+}

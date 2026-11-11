@@ -1,0 +1,100 @@
+name: Security scans
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  schedule:
+    - cron: '17 5 * * 1'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  go-security:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Set up Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache: false
+      # Exact pins: the Go module proxy verifies each version's module
+      # checksum, and the version tags resolve to these commits —
+      # govulncheck v1.9.0: e672cbe8fbc8c76e28fcb6db0efd9ce354e0dac5,
+      # go-licenses v2.0.1: 3e084b0caf710f7bfead967567539214f598c0a2,
+      # actionlint v1.7.12: 914e7df21a07ef503a81201c76d2b11c789d3fca.
+      - name: Install pinned security tools
+        run: |
+          set -euo pipefail
+          tool_dir="$RUNNER_TEMP/security-tools"
+          mkdir -p "$tool_dir"
+          GOBIN="$tool_dir" go install golang.org/x/vuln/cmd/govulncheck@v1.9.0
+          GOBIN="$tool_dir" go install github.com/google/go-licenses/v2@v2.0.1
+          GOBIN="$tool_dir" go install github.com/rhysd/actionlint/cmd/actionlint@v1.7.12
+          echo "$tool_dir" >> "$GITHUB_PATH"
+      - name: Lint workflow files
+        run: actionlint
+      - name: Check vulnerabilities including tests
+        run: govulncheck -test ./...
+      - name: Check nested cloud bootstrap vulnerabilities including tests
+        working-directory: cmd/cloud-tools-bootstrap
+        run: govulncheck -test ./...
+      - name: Check nested adapter vulnerabilities including tests
+        working-directory: ci/pdfua2/adapter
+        run: govulncheck -test ./...
+      - name: Check test-inclusive dependency licenses
+        shell: bash
+        run: bash scripts/check-licenses.sh root
+      - name: Check nested adapter test-inclusive dependency licenses
+        working-directory: ci/pdfua2/adapter
+        shell: bash
+        run: bash ../../../scripts/check-licenses.sh adapter
+      - name: Check cloud bootstrap module license exemption
+        run: bash scripts/check-licenses.sh bootstrap
+      - name: Verify license check script behavior
+        run: bash .github/scripts/test-check-licenses.sh
+      - name: Verify license policy rejects a test-only forbidden dependency
+        run: bash .github/scripts/test-go-licenses.sh
+
+  secrets:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout full history
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Set up Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+      # Exact pin: gitleaks v8.30.1 (tag resolves to commit
+      # 83d9cd684c87d95d656c1458ef04895a7f1cbd8e); the release tarball is
+      # verified against its pinned SHA-256 in the install step below.
+      - name: Install pinned Gitleaks
+        run: |
+          set -euo pipefail
+          curl --proto '=https' --fail --location --silent --show-error \
+            https://github.com/gitleaks/gitleaks/releases/download/v8.30.1/gitleaks_8.30.1_linux_x64.tar.gz \
+            --output /tmp/gitleaks_8.30.1_linux_x64.tar.gz
+          echo '551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb  /tmp/gitleaks_8.30.1_linux_x64.tar.gz' | sha256sum --check
+          tar -xzf /tmp/gitleaks_8.30.1_linux_x64.tar.gz -C /tmp gitleaks
+          sudo install -m 0755 /tmp/gitleaks /usr/local/bin/gitleaks
+      - name: Reject unmanaged Gitleaks config and ignore files
+        run: bash .github/scripts/check-gitleaks-suppressions.sh
+      - name: Verify Gitleaks clean, finding, and error behavior
+        run: bash .github/scripts/test-gitleaks.sh
+      - name: Gitleaks full-history scan
+        run: gitleaks git --log-opts=--all --redact=100 --ignore-gitleaks-allow --config=.security/gitleaks.toml --gitleaks-ignore-path=/dev/null --no-banner --timeout=300 .

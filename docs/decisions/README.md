@@ -1,0 +1,49 @@
+# Decision records
+
+The accepted output-validation target is recorded in [Decision 0001](0001-pdf-ua-2-validation-target.md). [Decision 0002](0002-initial-remediation-family-priority.md) gives statements and invoices with tables equal initial remediation priority. [Decision 0003](0003-operator-confirmed-financial-table-mapping.md) records operator-confirmed mapping for the first bounded workflow and future options discovery. These decisions do not approve a production writer. Add one Markdown record per other material decision, including status (**Proposed**, **Accepted**, or **Superseded**), context, evidence, alternatives, consequences, test evidence, and follow-up Beads issues.
+
+## Accepted decisions
+
+- [Decision 0001 — PDF/UA-2 validation target](0001-pdf-ua-2-validation-target.md).
+- [Decision 0002 — Initial remediation family priority](0002-initial-remediation-family-priority.md).
+- [Decision 0003 — Operator-confirmed financial-table mapping](0003-operator-confirmed-financial-table-mapping.md).
+- [Decision 0004 — Approver-persona review protocol and evidence handling](0004-approver-persona-review-protocol.md).
+- [Decision 0006 — Exact Beads source-continuation approval](0006-approved-beads-source-continuation.md).
+- [Decision 0007 — Exact Beads null-loss continuation after `dap-jo9.18`](0007-exact-beads-null-loss-continuation-after-jo9-18.md).
+- [Decision 0008 — Scoped canonical-export closure for `dap-jo9.18`](0008-scoped-dap-jo9-18-closure.md).
+- [Decision 0009 — Exact Beads source continuation after `dap-jo9.18` closure](0009-exact-beads-source-continuation-after-jo9-18-closure.md).
+- [Decision 0010 — Bounded PR #112 correction and source continuation](0010-bounded-pr112-correction-and-source-continuation.md).
+- [Decision 0011 — Bounded round-five owner decisions](0011-round-five-owner-decisions.md). Bounded R5-01 closure is delegated through `bd` plus guarded validation/promotion; R5-02 remains open, with no generic transition, closure-code, or null-loss policy authorized.
+- [Decision 0012 — Traceability checker scaling monitor mode](0012-traceability-checker-scaling-monitor-mode.md). No (size, runtime-budget) threshold pair is adopted — monitor mode; re-run the scaling benchmark and re-decide when catalog entities exceed 1,000 or repo-catalog `Validate` p50 (`-cpu=1`) exceeds 5 ms; review-by 2027-04-19. This is not a product performance budget.
+- [Decision 0014 — Profile policy decisions](0014-profile-policy-decisions.md). Approves four new document families (`presentations`, `forms`, `marketing`, `hr_documents`); defers `restricted` confidentiality and Spanish language support; APCA contrast checking removed per owner direction 2026-10-18, replaced by WCAG 2.2 contrast ratios (advisory measurements, not conformance gates); sets April 1, 2027 as an internal readiness target, distinct from the DOJ Title II rule's April 26, 2027 deadline for public entities serving 50,000 or more people and April 26, 2028 for smaller public entities and special district governments.
+- [Decision 0015 — Approver-role evidence source](0015-approver-role-evidence-source.md). Selects an owner-approved append-only register as the source category and records temporal policy; authenticated-source implementation and actual release identity remain open.
+- [Decision 0016 — Deferred restricted and Spanish scope](0016-deferred-scope-restricted-spanish.md). Defers restricted-class documents and Spanish-language support for launch.
+- [Decision 0017 — Approved shared profile-family set](0017-approved-profile-family-set.md).
+- [Decision 0018 — Keep AFP within the pipeline; retain its feasibility gates](0018-afp-not-a-separate-project.md).
+- [Decision 0019 — Approver register form](0019-approver-register-form.md). Selects a standalone signed append-only JSONL register with hash chaining, verified by a small adapter; writer authorization and trust-anchor key custody explicitly out of scope.
+- [Decision 0020 — First AFP source profile](0020-first-afp-source-profile.md). Selects the afpworld Sample_1_health.zip AFP as the first source profile, go-afp-line as the conversion engine, PDF 1.7 visual-fidelity target, and SHA-256-pinned HTML/PDF trusted references.
+- [Decision 0023 — Archive-lifecycle validation evidence placement](0023-archive-lifecycle-evidence-placement.md). Archive/toolchain lifecycle validation runs must be recorded as durable files under `docs/research/`, not only in PR bodies, so tree-only audits can see them.
+- [Decision 0024 — Approver-register JSON key case policy](0024-approver-register-key-case-policy.md). Liberal (case-insensitive) JSON key parsing accepted for the approver-register wire format; revisit on testing evidence of interop or hostile-input harm.
+- [Decision 0026 — Candidate eligibility standard: assessed evidence](0026-candidate-eligibility-standard.md). A candidate is eligible for the `dap-jo9.2.5.9` review gate when it is produced from immutable damaged bytes by a declared bounded operation, hash-bound preservation evidence is complete, pinned `ua2` runs on both the damaged input and the candidate are retained, every finding is classified inherited vs introduced with zero introduced findings, and compliance itself is not required (human/AT review under `.2.5.9` remains the acceptance step). Unblocks `dap-jo9.2.5.10`; Decision 0005's feasibility/eligibility boundary stands.
+
+## Proposed decisions
+
+- [Decision 0022 — go-afp-line dependency re-review](0022-go-afp-line-re-review.md). Re-reviews go-afp-line @ `492c4c7` per Decision 0021 §g + §k; verdict CONDITIONAL adoption, subject to 6 recorded conditions. As written it did not approve adoption — `dap-jo9.4.2` stayed with the product owner. Adoption status update (2026-10-23): the owner subsequently gave the GO ("Adopt and proceed", 2026-10-22), the exact pseudo-version `v0.1.0-beta.1.0.20261022163835-492c4c7d35b9` is pinned in the root `go.mod`, and the integration merged via PR #187; the GO's scope (test-only vs product runtime) is TBD pending owner decision #1 — see the draft [Decision 0025](0025-go-afp-line-adoption-go.md).
+
+## Drafts pending repository adoption
+
+- [Decision 0025 — go-afp-line adoption GO (DRAFT)](0025-go-afp-line-adoption-go.md) — records the owner's 2026-10-22 GO for the exact pinned pseudo-version; scope TBD pending owner decision #1. Draft for owner ratification, not an adopted decision.
+- [Cross-lane architecture checklist (DRAFT)](draft-cross-lane-architecture-checklist.md) — structures `dap-jo9.1.4`'s 7 architecture gates with status, required evidence, fixtures, alternatives, and owner. Not accepted.
+
+- [Historical v2 bounded association-repair Proceed](0005-historical-v2-bounded-association-proceed.md) records the accepted narrow historical disposition and exact proposed `.1.6.3`/`.1.6.4` updates. The linked [acceptance register](../reviews/pdfua2-bounded-proceed-acceptance-register-2026-10-15.md) preserves review excerpts and source hashes. Tracker states remain unchanged because the bd 1.3.1 export round-trip synthesized a non-factual `.5.5` `closed_at` and normalized unrelated fields; see Decision 0005 for provenance and limits.
+
+## Proposed decision topics
+
+- Data, accessibility, privacy, retention, and security profiles.
+- Existing-PDF writer/fidelity and remediation worker boundaries.
+- Open-source tool and license verification; enterprise-only remediation exports remain excluded.
+- Generation PDF engine and DOCX/Markdown conversion approach.
+- Semantic interpretation policy, human semantic review authority, and assistive-technology protocol.
+- IBM AFP migration feasibility and go/no-go criteria.
+
+Until a record is reviewed and accepted, roadmap candidates remain proposed. The accepted PDF/UA-2 target does not imply that any implementation or output has passed it.

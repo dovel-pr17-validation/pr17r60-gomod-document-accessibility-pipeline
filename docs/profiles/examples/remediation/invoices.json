@@ -1,0 +1,62 @@
+{
+  "schema_version": "1.1",
+  "status": "proposed",
+  "lane": "remediation",
+  "family": "invoices",
+  "language": {
+    "value": "en",
+    "status": "open"
+  },
+  "confidentiality": {
+    "value": "synthetic example only; production classification open",
+    "status": "open"
+  },
+  "retention": {
+    "value": "policy and retention period open",
+    "status": "open"
+  },
+  "accessibility": {
+    "value": "PDF/UA-2 is the accepted target; semantic conformance and human review remain separately required",
+    "status": "open"
+  },
+  "human_review": {
+    "value": "semantic and assistive-technology protocol and authority open",
+    "status": "open"
+  },
+  "source_fields": [
+    {
+      "name": "invoice_number",
+      "type": "string",
+      "status": "open"
+    },
+    {
+      "name": "line_items",
+      "type": "unknown",
+      "status": "open"
+    },
+    {
+      "name": "currency",
+      "type": "string",
+      "status": "open"
+    },
+    {
+      "name": "total",
+      "type": "number",
+      "status": "open"
+    },
+    {
+      "name": "invoice_date",
+      "type": "date",
+      "status": "open"
+    },
+    {
+      "name": "bill_to",
+      "type": "string",
+      "status": "open"
+    }
+  ],
+  "pdfua_target": {
+    "value": "PDF/UA-2",
+    "status": "accepted"
+  }
+}

@@ -1,0 +1,4238 @@
+package devsecops
+
+import (
+	"bytes"
+	"fmt"
+	"io"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"reflect"
+	"regexp"
+	"strconv"
+	"strings"
+	"testing"
+	"time"
+
+	"go.yaml.in/yaml/v3"
+)
+
+type workflow struct {
+	Name        string            `yaml:"name"`
+	On          map[string]any    `yaml:"on"`
+	Permissions map[string]string `yaml:"permissions"`
+	Concurrency struct {
+		Group            string `yaml:"group"`
+		CancelInProgress bool   `yaml:"cancel-in-progress"`
+	} `yaml:"concurrency"`
+	Env      map[string]string `yaml:"env"`
+	Defaults any               `yaml:"defaults"`
+	Jobs     map[string]job    `yaml:"jobs"`
+}
+
+type job struct {
+	RunsOn          string            `yaml:"runs-on"`
+	TimeoutMinutes  int               `yaml:"timeout-minutes"`
+	Permissions     map[string]string `yaml:"permissions"`
+	Steps           []step            `yaml:"steps"`
+	ContinueOnError bool              `yaml:"continue-on-error"`
+	If              string            `yaml:"if"`
+	Needs           any               `yaml:"needs"`
+	Env             map[string]string `yaml:"env"`
+	Defaults        any               `yaml:"defaults"`
+	Container       any               `yaml:"container"`
+}
+
+type step struct {
+	Name             string            `yaml:"name"`
+	Uses             string            `yaml:"uses"`
+	Run              string            `yaml:"run"`
+	WorkingDirectory string            `yaml:"working-directory"`
+	With             map[string]any    `yaml:"with"`
+	Env              map[string]string `yaml:"env"`
+	Shell            string            `yaml:"shell"`
+	TimeoutMinutes   int               `yaml:"timeout-minutes"`
+	ContinueOnError  bool              `yaml:"continue-on-error"`
+	If               string            `yaml:"if"`
+	Container        any               `yaml:"container"`
+}
+
+// pinnedScannerStepShell pins the execution shell for every scanner step
+// whose body the policy pins. No pinned scanner step may carry step-level
+// env: env alters execution without tripping the body pin, so any deviation
+// fails closed.
+var pinnedScannerStepShell = map[string]string{
+	"Check vulnerabilities including tests":                          "",
+	"Check nested cloud bootstrap vulnerabilities including tests":   "",
+	"Check nested adapter vulnerabilities including tests":           "",
+	"Install pinned security tools":                                  "",
+	"Check test-inclusive dependency licenses":                       "bash",
+	"Check nested adapter test-inclusive dependency licenses":        "bash",
+	"Check cloud bootstrap module license exemption":                 "",
+	"Verify license check script behavior":                           "",
+	"Verify license policy rejects a test-only forbidden dependency": "",
+	"Lint workflow files":                                            "",
+	"Install pinned Gitleaks":                                        "",
+	"Verify Gitleaks clean, finding, and error behavior":             "",
+	"Reject unmanaged Gitleaks config and ignore files":              "",
+	"Gitleaks full-history scan":                                     "",
+}
+
+type exceptionFile struct {
+	Version    int         `yaml:"version"`
+	Exceptions []exception `yaml:"exceptions"`
+}
+
+type exception struct {
+	ID      string   `yaml:"id"`
+	Paths   []string `yaml:"paths"`
+	Rules   []string `yaml:"rules"`
+	Reason  string   `yaml:"reason"`
+	Owner   string   `yaml:"owner"`
+	BeadsID string   `yaml:"beads_id"`
+	Expires string   `yaml:"expires"`
+}
+
+var (
+	actionSHAPattern  = regexp.MustCompile(`^[0-9a-f]{40}$`)
+	beadsIDPattern    = regexp.MustCompile(`^dap-[a-z0-9]+(?:\.[a-z0-9]+)*$`)
+	ownerPattern      = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9-]{1,38}$`)
+	probeSleepPattern = regexp.MustCompile(`^sleep ([0-9]+)m$`)
+)
+
+func readWorkflow(t *testing.T, name string) (workflow, string) {
+	t.Helper()
+	path := filepath.Join("..", "..", ".github", "workflows", name)
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Enforcement workflows decode strictly: any key outside the modeled
+	// schema fails closed instead of being silently dropped.
+	got, err := parseWorkflowForName(name, data)
+	if err != nil {
+		t.Fatalf("parse %s: %v", name, err)
+	}
+	return got, string(data)
+}
+
+func parseWorkflowForName(name string, data []byte) (workflow, error) {
+	return parseWorkflow(data, name == "go-checks.yml" || name == "security-scans.yml")
+}
+
+// parseGoChecksWorkflow strictly decodes the modeled go-checks workflow and
+// preserves exact YAML key spelling. Case-variant structural keys remain
+// unknown fields and are rejected; use this entry point for every policy test
+// that validates a mutated go-checks workflow.
+func parseGoChecksWorkflow(data []byte) (workflow, error) {
+	return parseWorkflow(data, true)
+}
+
+func parseWorkflow(data []byte, strict bool) (workflow, error) {
+	var got workflow
+	if strict {
+		decoder := yaml.NewDecoder(bytes.NewReader(data))
+		decoder.KnownFields(true)
+		if err := decoder.Decode(&got); err != nil {
+			return workflow{}, err
+		}
+		var extra any
+		if err := decoder.Decode(&extra); err != io.EOF {
+			if err == nil {
+				return workflow{}, fmt.Errorf("workflow must contain exactly one YAML document")
+			}
+			return workflow{}, err
+		}
+		return got, nil
+	}
+	var node yaml.Node
+	if err := yaml.Unmarshal(data, &node); err != nil {
+		return workflow{}, err
+	}
+	lowercaseStructuralKeys(&node)
+	normalized, err := yaml.Marshal(&node)
+	if err != nil {
+		return workflow{}, err
+	}
+	if err := yaml.Unmarshal(normalized, &got); err != nil {
+		return workflow{}, err
+	}
+	return got, nil
+}
+
+// lowercaseStructuralKeys is retained for callers that need the legacy
+// permissive parser. Enforcement workflows use strict, spelling-preserving
+// decoding and never call this normalization step.
+func lowercaseStructuralKeys(node *yaml.Node) {
+	walkNodeKeys(node)
+}
+
+func walkNodeKeys(node *yaml.Node) {
+	switch node.Kind {
+	case yaml.DocumentNode, yaml.SequenceNode:
+		for _, child := range node.Content {
+			walkNodeKeys(child)
+		}
+	case yaml.MappingNode:
+		for i := 0; i+1 < len(node.Content); i += 2 {
+			key, value := node.Content[i], node.Content[i+1]
+			lowered := ""
+			if key.Kind == yaml.ScalarNode && key.Tag == "!!str" {
+				lowered = strings.ToLower(key.Value)
+				key.Value = lowered
+			}
+			switch lowered {
+			case "env", "with", "permissions":
+				// Permission names (for example, `contents`) are values in a
+				// case-sensitive namespace, not workflow syntax keys.
+				continue
+			case "jobs":
+				if value.Kind == yaml.MappingNode {
+					for j := 1; j < len(value.Content); j += 2 {
+						walkNodeKeys(value.Content[j])
+					}
+				}
+				continue
+			}
+			walkNodeKeys(value)
+		}
+	}
+}
+
+func TestSecurityWorkflowUsesExpectedTriggersAndLeastPrivilege(t *testing.T) {
+	got, raw := readWorkflow(t, "security-scans.yml")
+	if err := validateWorkflow(got); err != nil {
+		t.Fatal(err)
+	}
+	if err := validateActionPins(got, raw); err != nil {
+		t.Fatal(err)
+	}
+	if err := validateMainAndWeeklyTriggers(got.On); err != nil {
+		t.Fatal(err)
+	}
+	for jobName, configured := range got.Jobs {
+		if configured.TimeoutMinutes < 5 || configured.TimeoutMinutes > 30 {
+			t.Errorf("job %s timeout must be between 5 and 30 minutes", jobName)
+		}
+		if len(configured.Permissions) != 0 {
+			t.Errorf("job %s unexpectedly overrides the read-only workflow token", jobName)
+		}
+	}
+}
+
+func TestSecurityWorkflowParserRejectsUnknownAndExtraDocuments(t *testing.T) {
+	_, raw := readWorkflow(t, "security-scans.yml")
+	cases := []struct {
+		name string
+		data string
+	}{
+		{"unknown root key", strings.Replace(raw, "permissions:\n", "permissons:\n", 1)},
+		{"case-variant root key", strings.Replace(raw, "permissions:\n", "PERMISSIONS:\n", 1)},
+		{"unknown job key", strings.Replace(raw, "    runs-on:", "    runs_onn:", 1)},
+		{"unknown step key", strings.Replace(raw, "        run:", "        ruN:", 1)},
+		{"second document", raw + "\n---\nname: hidden override\n"},
+		{"duplicate root key", raw + "\npermissions:\n  contents: read\n"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if _, err := parseWorkflowForName("security-scans.yml", []byte(tc.data)); err == nil {
+				t.Fatal("parseWorkflowForName accepted invalid security workflow")
+			}
+		})
+	}
+}
+
+func TestSecurityWorkflowParserKeepsEventAndWithMapsOpen(t *testing.T) {
+	_, raw := readWorkflow(t, "security-scans.yml")
+	mutated := strings.Replace(raw, "  pull_request:\n    branches: [main]\n", "  pull_request:\n    branches: [main]\n  workflow_dispatch: {}\n", 1)
+	mutated = strings.Replace(mutated, "  contents: read\n", "  contents: read\n  actions: none\n", 1)
+	mutated = strings.Replace(mutated, "          persist-credentials: false\n", "          persist-credentials: false\n          future-action-input: true\n", 1)
+	if _, err := parseWorkflowForName("security-scans.yml", []byte(mutated)); err != nil {
+		t.Fatalf("strict parser rejected open event or with data: %v", err)
+	}
+}
+
+func TestSecurityWorkflowRejectsInheritedExecutionOverrides(t *testing.T) {
+	_, raw := readWorkflow(t, "security-scans.yml")
+	cases := []struct {
+		name   string
+		mutate func(string) string
+	}{
+		{"root env", func(s string) string {
+			return strings.Replace(s, "permissions:\n", "env:\n  BASH_ENV: /tmp/override\n\npermissions:\n", 1)
+		}},
+		{"root defaults", func(s string) string {
+			return strings.Replace(s, "permissions:\n", "defaults:\n  run:\n    shell: 'bash -e {0}'\n\npermissions:\n", 1)
+		}},
+		{"job env", func(s string) string {
+			return strings.Replace(s, "    runs-on:", "    env:\n      BASH_ENV: /tmp/override\n    runs-on:", 1)
+		}},
+		{"job defaults", func(s string) string {
+			return strings.Replace(s, "    runs-on:", "    defaults:\n      run:\n        shell: 'bash -e {0}'\n    runs-on:", 1)
+		}},
+		{"job container", func(s string) string {
+			return strings.Replace(s, "    runs-on:", "    container:\n      image: attacker.invalid/runner:latest\n    runs-on:", 1)
+		}},
+		{"step container", func(s string) string {
+			return strings.Replace(s, "        run: actionlint\n", "        container: attacker.invalid/tool:latest\n        run: actionlint\n", 1)
+		}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := parseWorkflowForName("security-scans.yml", []byte(tc.mutate(raw)))
+			if err != nil {
+				t.Fatalf("parse security workflow: %v", err)
+			}
+			if err := validateScannerSteps(got); err == nil {
+				t.Fatal("validateScannerSteps accepted inherited execution override")
+			}
+		})
+	}
+}
+
+func TestNestedAdapterCarriesRootLicense(t *testing.T) {
+	rootLicense, err := os.ReadFile(filepath.Join("..", "..", "LICENSE"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	adapterLicense, err := os.ReadFile(filepath.Join("..", "..", "ci", "pdfua2", "adapter", "LICENSE"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(adapterLicense) != string(rootLicense) {
+		t.Fatal("nested CI-only module license must match the repository license")
+	}
+}
+
+func TestScannerStepsFailClosedAndUseFindingSensitiveModes(t *testing.T) {
+	got, raw := readWorkflow(t, "security-scans.yml")
+	assertGovulncheckStep(t, got, "Check vulnerabilities including tests", "")
+	assertGovulncheckStep(t, got, "Check nested cloud bootstrap vulnerabilities including tests", "cmd/cloud-tools-bootstrap")
+	assertGovulncheckStep(t, got, "Check nested adapter vulnerabilities including tests", "ci/pdfua2/adapter")
+	if err := validateScannerSteps(got); err != nil {
+		t.Fatal(err)
+	}
+
+	badCases := []struct {
+		name   string
+		mutate func(*workflow)
+	}{
+		{"govulncheck JSON mode exits successfully on findings", func(w *workflow) {
+			mutateRun(w, "Check vulnerabilities including tests", func(s *step) { s.Run = "govulncheck -test -json ./..." })
+		}},
+		{"nested adapter module omitted from vulnerability scan", func(w *workflow) {
+			mutateRun(w, "Check nested adapter vulnerabilities including tests", func(s *step) { s.WorkingDirectory = "." })
+		}},
+		{"nested cloud bootstrap module omitted from vulnerability scan", func(w *workflow) {
+			mutateRun(w, "Check nested cloud bootstrap vulnerabilities including tests", func(s *step) { s.WorkingDirectory = "." })
+		}},
+		{"nested cloud bootstrap scan uses finding-insensitive output", func(w *workflow) {
+			mutateRun(w, "Check nested cloud bootstrap vulnerabilities including tests", func(s *step) { s.Run = "govulncheck -test -json ./..." })
+		}},
+		{"nested cloud bootstrap scanner finding is swallowed", func(w *workflow) {
+			mutateRun(w, "Check nested cloud bootstrap vulnerabilities including tests", func(s *step) { s.Run += " || true" })
+		}},
+		{"nested cloud bootstrap scanner continues after failure", func(w *workflow) {
+			mutateRun(w, "Check nested cloud bootstrap vulnerabilities including tests", func(s *step) { s.ContinueOnError = true })
+		}},
+		{"scanner finding is swallowed", func(w *workflow) {
+			mutateRun(w, "Check vulnerabilities including tests", func(s *step) { s.Run += " || true" })
+		}},
+		{"scanner step continues after failure", func(w *workflow) {
+			mutateRun(w, "Check vulnerabilities including tests", func(s *step) { s.ContinueOnError = true })
+		}},
+		{"Gitleaks report may expose secrets", func(w *workflow) {
+			mutateRun(w, "Gitleaks full-history scan", func(s *step) { s.Run += " --report-format=json --report-path=report.json" })
+		}},
+		{"Gitleaks inline allow comments bypass scan", func(w *workflow) {
+			mutateRun(w, "Gitleaks full-history scan", func(s *step) { s.Run = strings.ReplaceAll(s.Run, " --ignore-gitleaks-allow", "") })
+		}},
+		{"Gitleaks repository config can replace defaults", func(w *workflow) {
+			mutateRun(w, "Gitleaks full-history scan", func(s *step) { s.Run = strings.ReplaceAll(s.Run, "--config=.security/gitleaks.toml", "") })
+		}},
+		{"Gitleaks source-level suppression files are not rejected", func(w *workflow) {
+			mutateRun(w, "Reject unmanaged Gitleaks config and ignore files", func(s *step) { s.Run = "printf 'suppression guard skipped'" })
+		}},
+		{"Gitleaks ignore file can suppress findings", func(w *workflow) {
+			mutateRun(w, "Gitleaks full-history scan", func(s *step) { s.Run = strings.ReplaceAll(s.Run, "--gitleaks-ignore-path=/dev/null", "") })
+		}},
+		{"license scan fails open", func(w *workflow) {
+			mutateRun(w, "Check test-inclusive dependency licenses", func(s *step) { s.Run += " || true" })
+		}},
+		{"license scan continues after failure", func(w *workflow) {
+			mutateRun(w, "Check test-inclusive dependency licenses", func(s *step) { s.ContinueOnError = true })
+		}},
+		{"nested adapter license scan fails open", func(w *workflow) {
+			mutateRun(w, "Check nested adapter test-inclusive dependency licenses", func(s *step) { s.Run += " || true" })
+		}},
+		{"nested adapter license scan continues after failure", func(w *workflow) {
+			mutateRun(w, "Check nested adapter test-inclusive dependency licenses", func(s *step) { s.ContinueOnError = true })
+		}},
+		{"nested adapter module omitted from license scan", func(w *workflow) {
+			mutateRun(w, "Check nested adapter test-inclusive dependency licenses", func(s *step) { s.WorkingDirectory = "." })
+		}},
+		{"actionlint failure is ignored", func(w *workflow) {
+			mutateRun(w, "Lint workflow files", func(s *step) { s.Run += " || true" })
+		}},
+		{"actionlint invocation is missing", func(w *workflow) {
+			mutateRun(w, "Lint workflow files", func(s *step) { s.Run = "printf 'lint skipped'" })
+		}},
+		{"actionlint runs from a redirected working directory", func(w *workflow) {
+			mutateRun(w, "Lint workflow files", func(s *step) { s.WorkingDirectory = "ci" })
+		}},
+		{"Gitleaks exit code is forced to success with the equals form", func(w *workflow) {
+			mutateRun(w, "Gitleaks full-history scan", func(s *step) { s.Run += " --exit-code=0" })
+		}},
+		{"Gitleaks exit code is forced to success with the space form", func(w *workflow) {
+			mutateRun(w, "Gitleaks full-history scan", func(s *step) { s.Run += " --exit-code 0" })
+		}},
+		{"Gitleaks baseline suppresses known findings with the equals form", func(w *workflow) {
+			mutateRun(w, "Gitleaks full-history scan", func(s *step) { s.Run += " --baseline-path=baseline.json" })
+		}},
+		{"Gitleaks baseline suppresses known findings with the space form", func(w *workflow) {
+			mutateRun(w, "Gitleaks full-history scan", func(s *step) { s.Run += " --baseline-path baseline.json" })
+		}},
+		// Census follow-up (docs/security/README.md, scanner suppression
+		// census): every form below passed the policy before the census
+		// because the only shell-level fail-open pattern was the literal
+		// "|| true". They are pinned here so the class, not just the
+		// originally reported strings, stays closed.
+		{"govulncheck exit code is neutralized with or-exit-zero", func(w *workflow) {
+			mutateRun(w, "Check vulnerabilities including tests", func(s *step) { s.Run += " || exit 0" })
+		}},
+		{"govulncheck exit code is neutralized with or-colon", func(w *workflow) {
+			mutateRun(w, "Check vulnerabilities including tests", func(s *step) { s.Run += " || :" })
+		}},
+		{"govulncheck exit code is neutralized with or-echo", func(w *workflow) {
+			mutateRun(w, "Check vulnerabilities including tests", func(s *step) { s.Run += " || echo suppressed" })
+		}},
+		{"govulncheck stderr is discarded", func(w *workflow) {
+			mutateRun(w, "Check vulnerabilities including tests", func(s *step) { s.Run += " 2>/dev/null" })
+		}},
+		{"govulncheck stdout findings are discarded", func(w *workflow) {
+			mutateRun(w, "Check vulnerabilities including tests", func(s *step) { s.Run += " >/dev/null" })
+		}},
+		{"govulncheck both streams are discarded in dup order", func(w *workflow) {
+			mutateRun(w, "Check vulnerabilities including tests", func(s *step) { s.Run += " 1>/dev/null 2>&1" })
+		}},
+		{"govulncheck stdout is discarded after stderr is duped to the log", func(w *workflow) {
+			mutateRun(w, "Check vulnerabilities including tests", func(s *step) { s.Run += " 2>&1 1>/dev/null" })
+		}},
+		{"govulncheck both streams are discarded with the ampersand form", func(w *workflow) {
+			mutateRun(w, "Check vulnerabilities including tests", func(s *step) { s.Run += " &>/dev/null" })
+		}},
+		{"govulncheck streams are redirected to a report file", func(w *workflow) {
+			mutateRun(w, "Check vulnerabilities including tests", func(s *step) { s.Run += " >report.txt 2>&1" })
+		}},
+		{"govulncheck stderr is redirected to an error file", func(w *workflow) {
+			mutateRun(w, "Check vulnerabilities including tests", func(s *step) { s.Run += " 2>errors.txt" })
+		}},
+		{"govulncheck output is piped to true", func(w *workflow) {
+			mutateRun(w, "Check vulnerabilities including tests", func(s *step) { s.Run += " | true" })
+		}},
+		{"govulncheck output is piped through cat", func(w *workflow) {
+			mutateRun(w, "Check vulnerabilities including tests", func(s *step) { s.Run += " | cat" })
+		}},
+		{"govulncheck output is piped through tee", func(w *workflow) {
+			mutateRun(w, "Check vulnerabilities including tests", func(s *step) { s.Run += " | tee report.txt" })
+		}},
+		{"govulncheck runs with errexit disabled", func(w *workflow) {
+			mutateRun(w, "Check vulnerabilities including tests", func(s *step) { s.Run = "set +e\n" + s.Run })
+		}},
+		{"govulncheck runs as an if condition", func(w *workflow) {
+			mutateRun(w, "Check vulnerabilities including tests", func(s *step) { s.Run = "if " + s.Run + "; then echo ok; fi" })
+		}},
+		{"govulncheck exit status is negated", func(w *workflow) {
+			mutateRun(w, "Check vulnerabilities including tests", func(s *step) { s.Run = "! " + s.Run })
+		}},
+		{"govulncheck output is captured by command substitution", func(w *workflow) {
+			mutateRun(w, "Check vulnerabilities including tests", func(s *step) { s.Run = "out=$(" + s.Run + ")" })
+		}},
+		{"govulncheck output is captured by backticks", func(w *workflow) {
+			mutateRun(w, "Check vulnerabilities including tests", func(s *step) { s.Run = "out=`" + s.Run + "`" })
+		}},
+		{"govulncheck runs in the background", func(w *workflow) {
+			mutateRun(w, "Check vulnerabilities including tests", func(s *step) { s.Run += " &" })
+		}},
+		{"govulncheck inherits an exec-redirected stderr", func(w *workflow) {
+			mutateRun(w, "Check vulnerabilities including tests", func(s *step) { s.Run = "exec 2>/dev/null\n" + s.Run })
+		}},
+		{"Gitleaks exit code is neutralized with or-exit-zero", func(w *workflow) {
+			mutateRun(w, "Gitleaks full-history scan", func(s *step) { s.Run += " || exit 0" })
+		}},
+		{"Gitleaks stderr findings log is discarded", func(w *workflow) {
+			mutateRun(w, "Gitleaks full-history scan", func(s *step) { s.Run += " 2>/dev/null" })
+		}},
+		{"Gitleaks output is piped through cat", func(w *workflow) {
+			mutateRun(w, "Gitleaks full-history scan", func(s *step) { s.Run += " | cat" })
+		}},
+		{"Gitleaks duplicate log-opts narrows the scanned history", func(w *workflow) {
+			mutateRun(w, "Gitleaks full-history scan", func(s *step) { s.Run += " --log-opts=-1" })
+		}},
+		{"Gitleaks duplicate log-opts repeats the pinned value", func(w *workflow) {
+			mutateRun(w, "Gitleaks full-history scan", func(s *step) { s.Run += " --log-opts=--all" })
+		}},
+		{"Gitleaks duplicate config replaces the pinned config", func(w *workflow) {
+			mutateRun(w, "Gitleaks full-history scan", func(s *step) { s.Run += " --config=evil.toml" })
+		}},
+		{"Gitleaks duplicate redact disables redaction", func(w *workflow) {
+			mutateRun(w, "Gitleaks full-history scan", func(s *step) { s.Run += " --redact=0" })
+		}},
+		{"license scan exit code is neutralized with or-exit-zero", func(w *workflow) {
+			mutateRun(w, "Check test-inclusive dependency licenses", func(s *step) { s.Run += " || exit 0" })
+		}},
+		{"license scan exit code is neutralized with or-colon", func(w *workflow) {
+			mutateRun(w, "Check test-inclusive dependency licenses", func(s *step) { s.Run += " || :" })
+		}},
+		{"nested adapter license scan exit code is neutralized with or-exit-zero", func(w *workflow) {
+			mutateRun(w, "Check nested adapter test-inclusive dependency licenses", func(s *step) { s.Run += " || exit 0" })
+		}},
+		{"nested adapter license scan exit code is neutralized with or-colon", func(w *workflow) {
+			mutateRun(w, "Check nested adapter test-inclusive dependency licenses", func(s *step) { s.Run += " || :" })
+		}},
+	}
+	for _, tc := range badCases {
+		t.Run(tc.name, func(t *testing.T) {
+			mutated := got
+			mutated.Jobs = cloneJobs(got.Jobs)
+			tc.mutate(&mutated)
+			if err := validateScannerSteps(mutated); err == nil {
+				t.Fatal("expected policy rejection")
+			}
+		})
+	}
+
+	condition := strings.Replace(raw, "      - name: Gitleaks full-history scan\n", "      - name: Gitleaks full-history scan\n        if: ${{ false }}\n", 1)
+	var conditional workflow
+	if err := yaml.Unmarshal([]byte(condition), &conditional); err != nil {
+		t.Fatal(err)
+	}
+	if err := validateScannerSteps(conditional); err == nil {
+		t.Fatal("scanner step guarded by a condition was accepted")
+	}
+
+	conditionalGovulncheck := strings.Replace(raw, "      - name: Check vulnerabilities including tests\n", "      - name: Check vulnerabilities including tests\n        if: ${{ false }}\n", 1)
+	var conditionalGovuln workflow
+	if err := yaml.Unmarshal([]byte(conditionalGovulncheck), &conditionalGovuln); err != nil {
+		t.Fatal(err)
+	}
+	if err := validateScannerSteps(conditionalGovuln); err == nil {
+		t.Fatal("govulncheck step guarded by a condition was accepted")
+	}
+
+	failOpenJob := strings.Replace(raw, "  go-security:\n", "  go-security:\n    continue-on-error: true\n", 1)
+	var failOpen workflow
+	if err := yaml.Unmarshal([]byte(failOpenJob), &failOpen); err != nil {
+		t.Fatal(err)
+	}
+	if err := validateWorkflow(failOpen); err == nil {
+		t.Fatal("job-level continue-on-error was accepted")
+	}
+	disabledSecurityJob := strings.Replace(raw, "  go-security:\n", "  go-security:\n    if: ${{ false }}\n", 1)
+	var disabled workflow
+	if err := yaml.Unmarshal([]byte(disabledSecurityJob), &disabled); err != nil {
+		t.Fatal(err)
+	}
+	if err := validateWorkflow(disabled); err == nil {
+		t.Fatal("security job guarded by a condition was accepted")
+	}
+}
+
+// TestScannerStepsAcceptPlumbingThatKeepsStreamsOnTheLog pins the accepted
+// side of the suppression boundary from the census in
+// docs/security/README.md: shell plumbing that keeps both scanner streams
+// attached to the step log and preserves the scanner exit status is not
+// suppression, and must keep validating so the token-aware check does not
+// degenerate into a substring ban on every operator.
+func TestScannerStepsAcceptPlumbingThatKeepsStreamsOnTheLog(t *testing.T) {
+	got, _ := readWorkflow(t, "security-scans.yml")
+	accepted := []struct {
+		name string
+		step string
+		run  func(string) string
+	}{
+		{"govulncheck stderr duped onto stdout", "Check vulnerabilities including tests", func(orig string) string { return orig + " 2>&1" }},
+		{"govulncheck stdout duped onto stderr", "Check vulnerabilities including tests", func(orig string) string { return orig + " 1>&2" }},
+		{"Gitleaks stderr duped onto stdout", "Gitleaks full-history scan", func(orig string) string { return orig + " 2>&1" }},
+		{"govulncheck in a bare subshell", "Check vulnerabilities including tests", func(orig string) string { return "( " + orig + " )" }},
+		{"govulncheck and-list keeps the scanner status", "Check vulnerabilities including tests", func(orig string) string { return orig + " && echo ok" }},
+		{"govulncheck sequence under errexit", "Check vulnerabilities including tests", func(orig string) string { return orig + "; echo done" }},
+	}
+	for _, tc := range accepted {
+		t.Run(tc.name, func(t *testing.T) {
+			mutated := got
+			mutated.Jobs = cloneJobs(got.Jobs)
+			mutateRun(&mutated, tc.step, func(s *step) { s.Run = tc.run(s.Run) })
+			if err := validateScannerSteps(mutated); err != nil {
+				t.Fatalf("policy rejected non-suppressing plumbing %q: %v", tc.name, err)
+			}
+		})
+	}
+}
+
+// TestSecurityWorkflowRejectsExpressionContinueOnError pins the YAML-level
+// census result: the modeled continue-on-error fields are booleans, so the
+// expression and quoted-string forms fail closed at parse time instead of
+// reaching a validator that could misread them.
+func TestSecurityWorkflowRejectsExpressionContinueOnError(t *testing.T) {
+	_, raw := readWorkflow(t, "security-scans.yml")
+	cases := []struct{ name, old, new string }{
+		{"step expression", "      - name: Check vulnerabilities including tests\n", "      - name: Check vulnerabilities including tests\n        continue-on-error: ${{ true }}\n"},
+		{"job expression", "  go-security:\n", "  go-security:\n    continue-on-error: ${{ true }}\n"},
+		{"step quoted string", "      - name: Check vulnerabilities including tests\n", "      - name: Check vulnerabilities including tests\n        continue-on-error: \"true\"\n"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			mutated := strings.Replace(raw, tc.old, tc.new, 1)
+			if mutated == raw {
+				t.Fatalf("mutation anchor %q not found", tc.old)
+			}
+			if _, err := parseWorkflow([]byte(mutated), true); err == nil {
+				t.Fatalf("strict workflow parse accepted %s continue-on-error", tc.name)
+			}
+		})
+	}
+}
+
+// TestScannerShellSuppression exercises the token-aware shell scan directly,
+// including spellings the workflow-level mutations do not use (spaced and
+// glued redirection operators).
+func TestScannerShellSuppression(t *testing.T) {
+	cases := []struct {
+		name    string
+		command string
+		want    string // substring of the suppression reason; "" means accepted
+	}{
+		{"plain pinned govulncheck", "govulncheck -test ./...", ""},
+		{"plain pinned gitleaks", "gitleaks git --log-opts=--all .", ""},
+		{"spaced stderr redirect", "govulncheck -test ./... 2> /dev/null", "redirects"},
+		{"spaced stdout redirect", "govulncheck -test ./... > /dev/null", "redirects"},
+		{"glued stdout redirect", "govulncheck -test ./...>/dev/null", "redirects"},
+		{"closed stderr", "govulncheck -test ./... 2>&-", "redirects"},
+		{"dup onto the log is accepted", "govulncheck -test ./... 2>&1", ""},
+		{"dup first still flags a later stdout sink", "govulncheck -test ./... 2>&1 1>/dev/null", "redirects"},
+		{"install step scanner path is not an invocation", "go install golang.org/x/vuln/cmd/govulncheck@v1.9.0", ""},
+		{"tar member named gitleaks is not an invocation", "tar -xzf /tmp/gitleaks.tar.gz -C /tmp gitleaks", ""},
+		{"or list with another command", "gitleaks git . || echo ok", "||"},
+		{"backgrounded scanner", "govulncheck -test ./... &", "background"},
+		{"negated scanner", "! govulncheck -test ./...", "condition"},
+		{"scanner as if condition", "if govulncheck -test ./...; then echo ok; fi", "condition"},
+		{"captured scanner", "out=$(govulncheck -test ./...)", "command substitution"},
+		{"piped scanner", "govulncheck -test ./... | tee report.txt", "pipe"},
+		{"exec redirect before scanner", "exec 2>/dev/null\ngovulncheck -test ./...", "redirects"},
+		{"non-scanner pipe is out of scope", "grep -Ev '^[[:space:]]*(#|$)' .security/allowed-go-licenses.txt | paste -sd, -", ""},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := scannerShellSuppression(tc.command)
+			if tc.want == "" {
+				if got != "" {
+					t.Fatalf("scannerShellSuppression(%q) = %q, want no suppression", tc.command, got)
+				}
+				return
+			}
+			if !strings.Contains(got, tc.want) {
+				t.Fatalf("scannerShellSuppression(%q) = %q, want a reason containing %q", tc.command, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestScannerShellSuppressionShellWrapper pins the shell-wrapper bypass a
+// review of the suppression census found: in
+// "bash -c 'govulncheck -test ./... || true'" the lexer folds the quoted
+// script into a single word token, so the list check and the
+// scanner-in-command-position scan never saw the "|| true" while the
+// required invocation substring was still present, and the wrapper exited
+// 0 for a failing scanner. A pinned scanner invoked through a shell -c
+// wrapper is rejected outright (the repository's own security workflow
+// invokes every scanner directly), whatever the wrapped script does.
+func TestScannerShellSuppressionShellWrapper(t *testing.T) {
+	cases := []struct {
+		name    string
+		command string
+		want    string // substring of the suppression reason; "" means accepted
+	}{
+		{"bash -c wrapper with or-true", "bash -c 'govulncheck -test ./... || true'", "shell -c wrapper"},
+		{"sh -c wrapper with or-true", "sh -c 'govulncheck -test ./... || true'", "shell -c wrapper"},
+		{"absolute bash -c wrapper with or-true", "/bin/bash -c 'govulncheck -test ./... || true'", "shell -c wrapper"},
+		{"bash combined-flag -ec wrapper with or-true", "bash -ec 'govulncheck -test ./... || true'", "shell -c wrapper"},
+		{"bash -c double-quoted wrapper with or-true", `bash -c "govulncheck -test ./... || true"`, "shell -c wrapper"},
+		{"clean bash -c wrapper is still a wrapper", "bash -c 'govulncheck -test ./...'", "shell -c wrapper"},
+		{"bash -c wrapper redirecting scanner stderr", "bash -c 'govulncheck ./... 2>/dev/null'", "shell -c wrapper"},
+		{"bash -c wrapper around gitleaks with or-true", "bash -c 'gitleaks git . || true'", "shell -c wrapper"},
+		{"sh -c wrapper around gitleaks redirecting stderr", "sh -c 'gitleaks git . 2>/dev/null'", "shell -c wrapper"},
+		{"nested shell -c wrapper", "bash -c 'bash -c \"govulncheck -test ./... || true\"'", "shell -c wrapper"},
+		{"wrapper around a non-scanner command is out of scope", "bash -c 'echo ok'", ""},
+		{"wrapper script naming a scanner only as an argument is out of scope", "bash -c 'tar -xzf /tmp/gitleaks.tar.gz -C /tmp gitleaks'", ""},
+		{"script file invocation is not a -c wrapper", "bash .github/scripts/test-gitleaks.sh", ""},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := scannerShellSuppression(tc.command)
+			if tc.want == "" {
+				if got != "" {
+					t.Fatalf("scannerShellSuppression(%q) = %q, want no suppression", tc.command, got)
+				}
+				return
+			}
+			if !strings.Contains(got, tc.want) {
+				t.Fatalf("scannerShellSuppression(%q) = %q, want a reason containing %q", tc.command, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestScannerStepsRejectShellWrappedScannerSuppression is the workflow-level
+// regression test for the same bypass: mutating the pinned govulncheck or
+// Gitleaks step of security-scans.yml into a shell -c wrapper must be
+// rejected by validateScannerSteps, the same entry point that rejects the
+// unwrapped suppression forms.
+func TestScannerStepsRejectShellWrappedScannerSuppression(t *testing.T) {
+	got, _ := readWorkflow(t, "security-scans.yml")
+	cases := []struct {
+		name string
+		step string
+		run  func(string) string
+	}{
+		{"govulncheck wrapped in bash -c with or-true", "Check vulnerabilities including tests", func(string) string {
+			return "bash -c 'govulncheck -test ./... || true'"
+		}},
+		{"govulncheck wrapped in sh -c with or-true", "Check vulnerabilities including tests", func(string) string {
+			return "sh -c 'govulncheck -test ./... || true'"
+		}},
+		{"govulncheck wrapped in /bin/bash -c with or-true", "Check vulnerabilities including tests", func(string) string {
+			return "/bin/bash -c 'govulncheck -test ./... || true'"
+		}},
+		{"govulncheck wrapped in bash -ec with or-true", "Check vulnerabilities including tests", func(string) string {
+			return "bash -ec 'govulncheck -test ./... || true'"
+		}},
+		{"govulncheck wrapped in double-quoted bash -c with or-true", "Check vulnerabilities including tests", func(string) string {
+			return `bash -c "govulncheck -test ./... || true"`
+		}},
+		{"govulncheck wrapped in bash -c redirecting stderr", "Check vulnerabilities including tests", func(string) string {
+			return "bash -c 'govulncheck -test ./... 2>/dev/null'"
+		}},
+		{"Gitleaks wrapped in bash -c with or-true", "Gitleaks full-history scan", func(orig string) string {
+			return "bash -c '" + orig + " || true'"
+		}},
+		{"Gitleaks wrapped in sh -c with or-true", "Gitleaks full-history scan", func(orig string) string {
+			return "sh -c '" + orig + " || true'"
+		}},
+		{"Gitleaks wrapped in bash -c redirecting stderr", "Gitleaks full-history scan", func(orig string) string {
+			return "bash -c '" + orig + " 2>/dev/null'"
+		}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			mutated := got
+			mutated.Jobs = cloneJobs(got.Jobs)
+			mutateRun(&mutated, tc.step, func(s *step) { s.Run = tc.run(s.Run) })
+			if err := validateScannerSteps(mutated); err == nil {
+				t.Fatal("validateScannerSteps accepted a shell -c wrapped scanner step")
+			}
+		})
+	}
+}
+
+// TestScannerShellSuppressionCommandSubstitution pins the command
+// substitution bypass a review found in the shell -c wrapper fix: in
+// `out="$(govulncheck -test ./... || true)"` the lexer folds the whole
+// double-quoted assignment into one word token, so neither the "$(" token
+// scan nor the "||" list check ever saw the scanner invocation or the
+// suppression inside it, while the required invocation substring was still
+// present in the step text. Executed under bash -e with a scanner
+// returning 3, the assignment exits 0 — findings silently suppressed. The
+// quote state does not change execution: command substitution runs inside
+// double quotes exactly as it does unquoted, and in every position
+// (assignment value, bare command, argument), for both the "$(...)" and
+// backtick spellings. Inside single quotes it does NOT run — the text is
+// a literal — and that distinction is pinned as accepted below.
+func TestScannerShellSuppressionCommandSubstitution(t *testing.T) {
+	cases := []struct {
+		name    string
+		command string
+		want    string // substring of the suppression reason; "" means accepted
+	}{
+		{"double-quoted assignment captures govulncheck with or-true", `out="$(govulncheck -test ./... || true)"`, "command substitution"},
+		{"double-quoted assignment captures govulncheck without or-true", `out="$(govulncheck -test ./...)"`, "command substitution"},
+		{"bare command substitution runs govulncheck", `$(govulncheck -test ./...)`, "command substitution"},
+		{"argument substitution captures govulncheck with or-true", `echo "$(govulncheck -test ./... || true)"`, "command substitution"},
+		{"unquoted argument substitution captures govulncheck", `echo $(govulncheck -test ./...)`, "command substitution"},
+		{"backtick assignment captures govulncheck with or-true", "out=`govulncheck -test ./... || true`", "command substitution"},
+		{"double-quoted backtick assignment captures govulncheck", "out=\"`govulncheck -test ./...`\"", "command substitution"},
+		{"double-quoted assignment captures gitleaks with or-true", `out="$(gitleaks git --log-opts=--all . || true)"`, "command substitution"},
+		{"backtick assignment captures gitleaks with or-true", "out=`gitleaks git . || true`", "command substitution"},
+		{"nested substitution captures govulncheck", `out="$(echo "$(govulncheck -test ./...)")"`, "command substitution"},
+		{"single-quoted substitution text does not execute", `echo '$(govulncheck -test ./... || true)'`, ""},
+		{"single-quoted substitution literal beside a direct scanner", "govulncheck -test ./...\necho 'literal $(govulncheck -test ./...) and `gitleaks` text'", ""},
+		{"non-scanner substitution is out of scope", `allowed="$(grep -Ev '^[[:space:]]*(#|$)' .security/allowed-go-licenses.txt | paste -sd, -)"`, ""},
+		{"escaped substitution does not execute", `echo \$(govulncheck -test ./...)`, ""},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := scannerShellSuppression(tc.command)
+			if tc.want == "" {
+				if got != "" {
+					t.Fatalf("scannerShellSuppression(%q) = %q, want no suppression", tc.command, got)
+				}
+				return
+			}
+			if !strings.Contains(got, tc.want) {
+				t.Fatalf("scannerShellSuppression(%q) = %q, want a reason containing %q", tc.command, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestScannerStepsRejectCommandSubstitutedScannerSuppression is the
+// workflow-level regression test for the same bypass: mutating the pinned
+// govulncheck or Gitleaks step of security-scans.yml so the invocation
+// sits inside an executed command substitution must be rejected by
+// validateScannerSteps, the same entry point that rejects the unwrapped
+// suppression forms. The first case is the review's exact repro: the
+// required invocation substring remains present (inside the assignment),
+// and the step would exit 0 for a failing scanner.
+func TestScannerStepsRejectCommandSubstitutedScannerSuppression(t *testing.T) {
+	got, _ := readWorkflow(t, "security-scans.yml")
+	cases := []struct {
+		name string
+		step string
+		run  func(string) string
+	}{
+		{"govulncheck double-quoted assignment with or-true (exact repro)", "Check vulnerabilities including tests", func(string) string {
+			return `out="$(govulncheck -test ./... || true)"`
+		}},
+		{"govulncheck bare command substitution", "Check vulnerabilities including tests", func(orig string) string {
+			return "$(" + orig + ")"
+		}},
+		{"govulncheck substitution as an argument with or-true", "Check vulnerabilities including tests", func(orig string) string {
+			return `echo "$(` + orig + ` || true)"`
+		}},
+		{"govulncheck backtick assignment with or-true", "Check vulnerabilities including tests", func(orig string) string {
+			return "out=`" + orig + " || true`"
+		}},
+		{"Gitleaks double-quoted assignment with or-true", "Gitleaks full-history scan", func(orig string) string {
+			return `out="$(` + orig + ` || true)"`
+		}},
+		{"Gitleaks backtick assignment with or-true", "Gitleaks full-history scan", func(orig string) string {
+			return "out=`" + orig + " || true`"
+		}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			mutated := got
+			mutated.Jobs = cloneJobs(got.Jobs)
+			mutateRun(&mutated, tc.step, func(s *step) { s.Run = tc.run(s.Run) })
+			if err := validateScannerSteps(mutated); err == nil {
+				t.Fatal("validateScannerSteps accepted a command-substituted scanner step")
+			}
+		})
+	}
+}
+
+// TestScannerStepsAcceptSingleQuotedSubstitutionLiteral pins the quoting
+// side of the rule at workflow level: substitution syntax inside single
+// quotes is literal text that never executes, so a direct scanner step
+// that merely echoes such a literal keeps validating.
+func TestScannerStepsAcceptSingleQuotedSubstitutionLiteral(t *testing.T) {
+	got, _ := readWorkflow(t, "security-scans.yml")
+	mutated := got
+	mutated.Jobs = cloneJobs(got.Jobs)
+	mutateRun(&mutated, "Check vulnerabilities including tests", func(s *step) {
+		s.Run = s.Run + "\necho 'literal $(govulncheck -test ./...) text'"
+	})
+	if err := validateScannerSteps(mutated); err != nil {
+		t.Fatalf("policy rejected single-quoted substitution literal: %v", err)
+	}
+}
+
+// TestWorkflowsRejectSelfHostedRunners covers R7-01: a self-hosted runner
+// executes scanner and check jobs outside GitHub-hosted runner isolation, so
+// no workflow in the repository may select one. The on-disk scan covers every
+// workflow file; the mutation cases prove the validators behind the security
+// and Go checks workflows reject the label instead of merely not using it.
+func TestWorkflowsRejectSelfHostedRunners(t *testing.T) {
+	dir := filepath.Join("..", "..", ".github", "workflows")
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	scanned := 0
+	for _, entry := range entries {
+		if entry.IsDir() || (!strings.HasSuffix(entry.Name(), ".yml") && !strings.HasSuffix(entry.Name(), ".yaml")) {
+			continue
+		}
+		scanned++
+		data, err := os.ReadFile(filepath.Join(dir, entry.Name()))
+		if err != nil {
+			t.Fatal(err)
+		}
+		parsed, err := parseWorkflow(data, false)
+		if err != nil {
+			t.Fatalf("parse %s: %v", entry.Name(), err)
+		}
+		if err := validateRunnerLabels(parsed); err != nil {
+			t.Errorf("%s: %v", entry.Name(), err)
+		}
+	}
+	if scanned == 0 {
+		t.Fatal("no workflow files were scanned for self-hosted runners")
+	}
+
+	t.Run("security workflow mutation is rejected", func(t *testing.T) {
+		security, _ := readWorkflow(t, "security-scans.yml")
+		mutated := security
+		mutated.Jobs = cloneJobs(security.Jobs)
+		configured := mutated.Jobs["go-security"]
+		configured.RunsOn = "self-hosted"
+		mutated.Jobs["go-security"] = configured
+		if err := validateWorkflow(mutated); err == nil || !strings.Contains(err.Error(), "must not run on a self-hosted runner") {
+			t.Fatalf("validateWorkflow rejection = %v, want a self-hosted runner error", err)
+		}
+	})
+
+	t.Run("go checks workflow mutation is rejected", func(t *testing.T) {
+		security, _ := readWorkflow(t, "security-scans.yml")
+		project, _ := readWorkflow(t, "go-checks.yml")
+		mutated := project
+		mutated.Jobs = cloneJobs(project.Jobs)
+		configured := mutated.Jobs["checks"]
+		configured.RunsOn = "self-hosted"
+		mutated.Jobs["checks"] = configured
+		if err := validateScannerIsolation(security, mutated); err == nil || !strings.Contains(err.Error(), "must not run on a self-hosted runner") {
+			t.Fatalf("validateScannerIsolation rejection = %v, want a self-hosted runner error", err)
+		}
+	})
+}
+
+func assertGovulncheckStep(t *testing.T, w workflow, name, workingDirectory string) {
+	t.Helper()
+	for _, configured := range w.Jobs {
+		for _, s := range configured.Steps {
+			if s.Name != name {
+				continue
+			}
+			if s.WorkingDirectory != workingDirectory {
+				t.Fatalf("%s working-directory = %q, want %q", name, s.WorkingDirectory, workingDirectory)
+			}
+			if strings.TrimSpace(s.Run) != "govulncheck -test ./..." {
+				t.Fatalf("%s run = %q, want test-inclusive exit-status govulncheck", name, s.Run)
+			}
+			if s.ContinueOnError || strings.TrimSpace(s.If) != "" || strings.Contains(s.Run, "|| true") {
+				t.Fatalf("%s must be unconditional and fail closed", name)
+			}
+			return
+		}
+	}
+	t.Fatalf("required govulncheck step %q was not found", name)
+}
+
+func TestSecurityScannersUseSeparateRunnerFromProjectTests(t *testing.T) {
+	security, _ := readWorkflow(t, "security-scans.yml")
+	project, _ := readWorkflow(t, "go-checks.yml")
+	if err := validateScannerIsolation(security, project); err != nil {
+		t.Fatal(err)
+	}
+
+	t.Run("project test added to scanner job", func(t *testing.T) {
+		mutated := security
+		mutated.Jobs = cloneJobs(security.Jobs)
+		scanner := mutated.Jobs["go-security"]
+		scanner.Steps = append(scanner.Steps, step{Name: "Run PR-controlled tests", Run: "go test -race ./..."})
+		mutated.Jobs["go-security"] = scanner
+		if err := validateScannerIsolation(mutated, project); err == nil || !strings.Contains(err.Error(), "executes project Go code") {
+			t.Fatalf("scanner job running PR-controlled tests rejection = %v, want project-code isolation error", err)
+		}
+	})
+
+	t.Run("project tests removed from isolated workflow", func(t *testing.T) {
+		mutated := project
+		mutated.Jobs = cloneJobs(project.Jobs)
+		checks := mutated.Jobs["checks"]
+		for i, candidate := range checks.Steps {
+			if candidate.Name == "Test with race detector" {
+				checks.Steps = append(checks.Steps[:i], checks.Steps[i+1:]...)
+				break
+			}
+		}
+		mutated.Jobs["checks"] = checks
+		if err := validateScannerIsolation(security, mutated); err == nil || !strings.Contains(err.Error(), "must keep") {
+			t.Fatalf("workflow without isolated project tests rejection = %v, want missing-project-check error", err)
+		}
+	})
+	t.Run("root module tidy check removed from isolated workflow", func(t *testing.T) {
+		mutated := project
+		mutated.Jobs = cloneJobs(project.Jobs)
+		checks := mutated.Jobs["checks"]
+		for i, candidate := range checks.Steps {
+			if candidate.Name == "Check module files" {
+				checks.Steps = append(checks.Steps[:i], checks.Steps[i+1:]...)
+				break
+			}
+		}
+		mutated.Jobs["checks"] = checks
+		if err := validateScannerIsolation(security, mutated); err == nil || !strings.Contains(err.Error(), `keep "Check module files" running "go mod tidy -diff"`) {
+			t.Fatalf("workflow without root module tidy check rejection = %v, want missing-root-tidy error", err)
+		}
+	})
+
+	t.Run("scanner Go cache shared with project tests", func(t *testing.T) {
+		mutated := security
+		mutated.Jobs = cloneJobs(security.Jobs)
+		scanner := mutated.Jobs["go-security"]
+		for i := range scanner.Steps {
+			if scanner.Steps[i].Name == "Set up Go" {
+				scanner.Steps[i].With["cache"] = true
+			}
+		}
+		mutated.Jobs["go-security"] = scanner
+		if err := validateScannerIsolation(mutated, project); err == nil || !strings.Contains(err.Error(), "must not restore or save a Go build cache") {
+			t.Fatalf("scanner job with shared Go cache rejection = %v, want cache-isolation error", err)
+		}
+		original := security.Jobs["go-security"]
+		for _, candidate := range original.Steps {
+			if candidate.Name == "Set up Go" && candidate.With["cache"] != false {
+				t.Fatalf("mutating cloned scanner job changed original setup-go cache setting to %#v", candidate.With["cache"])
+			}
+		}
+	})
+
+	t.Run("scanner binaries installed outside the runner temp directory", func(t *testing.T) {
+		mutated := security
+		mutated.Jobs = cloneJobs(security.Jobs)
+		mutateRun(&mutated, "Install pinned security tools", func(s *step) {
+			s.Run = strings.ReplaceAll(s.Run, "GOBIN=\"$tool_dir\" ", "")
+		})
+		if err := validateScannerIsolation(mutated, project); err == nil || !strings.Contains(err.Error(), "private RUNNER_TEMP directory") {
+			t.Fatalf("scanner installation without private runner-temp GOBIN rejection = %v, want GOBIN-isolation error", err)
+		}
+	})
+}
+
+// TestGoChecksModuleGateRemovalIsRejected is the dap-jo9.5.6 negative proof:
+// removing any of the nine root and nested-module gates from the go-checks
+// "checks" job must fail validateScannerIsolation with an error naming the
+// removed gate. The unmutated presence check keeps each subtest from going
+// vacuous if a gate step is ever renamed rather than removed.
+func TestGoChecksModuleGateRemovalIsRejected(t *testing.T) {
+	security, _ := readWorkflow(t, "security-scans.yml")
+	project, _ := readWorkflow(t, "go-checks.yml")
+
+	for _, gate := range requiredGoChecksSteps {
+		if !gate.moduleGate {
+			continue
+		}
+		gate := gate
+		t.Run(gate.name, func(t *testing.T) {
+			matches := func(candidate step) bool {
+				return candidate.Name == gate.name &&
+					candidate.WorkingDirectory == gate.workingDirectory &&
+					strings.TrimSpace(candidate.Run) == gate.run
+			}
+
+			// The gate must exist unmutated, or the removal probe proves nothing.
+			unmutatedFound := false
+			for _, candidate := range project.Jobs["checks"].Steps {
+				if matches(candidate) {
+					unmutatedFound = true
+					break
+				}
+			}
+			if !unmutatedFound {
+				t.Fatalf("gate %q running %q (working directory %q) missing from the go-checks job; test is vacuous against a renamed step", gate.name, gate.run, gate.workingDirectory)
+			}
+
+			mutated := project
+			mutated.Jobs = cloneJobs(project.Jobs)
+			checks := mutated.Jobs["checks"]
+			removed := false
+			for i, candidate := range checks.Steps {
+				if matches(candidate) {
+					checks.Steps = append(checks.Steps[:i], checks.Steps[i+1:]...)
+					removed = true
+					break
+				}
+			}
+			if !removed {
+				t.Fatalf("could not splice gate %q out of the cloned go-checks job", gate.name)
+			}
+			mutated.Jobs["checks"] = checks
+
+			err := validateScannerIsolation(security, mutated)
+			if err == nil || !strings.Contains(err.Error(), gate.name) {
+				t.Fatalf("workflow without gate %q rejection = %v, want error naming the removed gate", gate.name, err)
+			}
+			if !strings.Contains(err.Error(), gate.run) {
+				t.Fatalf("workflow without gate %q rejection = %v, want error naming the removed command", gate.name, err)
+			}
+		})
+	}
+}
+
+func TestFinancialFixtureDependencyGateFailsClosed(t *testing.T) {
+	project, _ := readWorkflow(t, "go-checks.yml")
+	var run string
+	for _, candidate := range project.Jobs["checks"].Steps {
+		if candidate.Name == "Keep pdfcpu out of the financial fixtures CLI dependency graph" {
+			run = candidate.Run
+			break
+		}
+	}
+	if strings.TrimSpace(run) == "" {
+		t.Fatal("financial-fixture dependency gate is missing")
+	}
+	bin := t.TempDir()
+	goStub := "#!/bin/sh\ncase \"$GO_LIST_MODE\" in\n  clean) printf 'example.org/clean\\n' ;;\n  pdfcpu) printf 'github.com/pdfcpu/pdfcpu/pkg/api\\n' ;;\n  error) exit 23 ;;\n  *) exit 24 ;;\nesac\n"
+	goPath := filepath.Join(bin, "go")
+	if err := os.WriteFile(goPath, []byte(goStub), 0700); err != nil {
+		t.Fatal(err)
+	}
+	for _, tc := range []struct {
+		mode    string
+		wantErr bool
+	}{
+		{mode: "clean"},
+		{mode: "pdfcpu", wantErr: true},
+		{mode: "error", wantErr: true},
+	} {
+		t.Run(tc.mode, func(t *testing.T) {
+			cmd := exec.Command("bash", "-e", "-o", "pipefail", "-c", run)
+			cmd.Env = []string{"PATH=" + bin + ":" + os.Getenv("PATH"), "GO_LIST_MODE=" + tc.mode}
+			output, err := cmd.CombinedOutput()
+			if (err != nil) != tc.wantErr {
+				t.Fatalf("dependency gate error = %v, wantErr %t; output: %s", err, tc.wantErr, output)
+			}
+			if tc.mode == "error" && !strings.Contains(string(output), "go list dependency scan failed") {
+				t.Fatalf("go list failure output = %q, want explicit failure diagnostic", output)
+			}
+		})
+	}
+}
+
+func TestGoChecksAdapterGateClearsRealCLIEnvironment(t *testing.T) {
+	security, _ := readWorkflow(t, "security-scans.yml")
+	project, _ := readWorkflow(t, "go-checks.yml")
+
+	mutated := project
+	mutated.Jobs = cloneJobs(project.Jobs)
+	mutateRun(&mutated, "Test PDF/UA-2 adapter module", func(s *step) {
+		s.Run = "go test -race ./... -count=1"
+	})
+
+	err := validateScannerIsolation(security, mutated)
+	if err == nil {
+		t.Fatal("adapter gate without PDFUA_REAL_CLI_JAR clearing was accepted")
+	}
+	if !strings.Contains(err.Error(), "env PDFUA_REAL_CLI_JAR= go test -race ./... -count=1") {
+		t.Fatalf("adapter gate rejection = %v, want required command with PDFUA_REAL_CLI_JAR cleared", err)
+	}
+}
+
+// TestFuzzSmokeWorkflowIsNonBlockingAndCoversAllTargets covers R5-10: the
+// fuzz smoke workflow runs every fuzz target for a fixed short duration
+// against its seed corpus, but a crasher must surface as an uploaded
+// artifact and a step summary — never as a blocked merge.
+func TestFuzzSmokeWorkflowIsNonBlockingAndCoversAllTargets(t *testing.T) {
+	got, raw := readWorkflow(t, "fuzz-smoke.yml")
+	if err := validateWorkflow(got); err != nil {
+		t.Fatal(err)
+	}
+	if err := validateActionPins(got, raw); err != nil {
+		t.Fatal(err)
+	}
+	job, ok := got.Jobs["fuzz-smoke"]
+	if !ok {
+		t.Fatal("fuzz-smoke workflow must define the fuzz-smoke job")
+	}
+	targets := map[string]string{
+		"Fuzz FuzzParseReport in internal/pdfua":   "go test -run='^$' -fuzz=FuzzParseReport -fuzztime=45s ./internal/pdfua/",
+		"Fuzz FuzzParseEntry in internal/approver": "go test -run='^$' -fuzz=FuzzParseEntry -fuzztime=45s ./internal/approver/",
+	}
+	for name, run := range targets {
+		s := findStep(t, got, name)
+		if s.Run != run {
+			t.Errorf("step %q run = %q, want %q", name, s.Run, run)
+		}
+		if !s.ContinueOnError {
+			t.Errorf("step %q must continue on error so a crasher cannot block merges", name)
+		}
+	}
+	upload := findStep(t, got, "Upload fuzz crashers")
+	if !strings.HasPrefix(upload.Uses, "actions/upload-artifact@") {
+		t.Errorf("crasher upload step uses = %q, want the pinned actions/upload-artifact action", upload.Uses)
+	}
+	if !strings.Contains(upload.If, "steps.fuzz-pdfua.outcome") || !strings.Contains(upload.If, "steps.fuzz-approver.outcome") {
+		t.Errorf("crasher upload step if = %q, want it keyed to both fuzz step outcomes", upload.If)
+	}
+	summary := findStep(t, got, "Summarize fuzz smoke results")
+	if !strings.Contains(summary.If, "always()") || !strings.Contains(summary.Run, "GITHUB_STEP_SUMMARY") {
+		t.Errorf("summary step must always write the fuzz outcomes to the step summary, got if=%q run=%q", summary.If, summary.Run)
+	}
+	if job.RunsOn != "ubuntu-24.04" {
+		t.Errorf("fuzz-smoke job runs-on = %q, want ubuntu-24.04", job.RunsOn)
+	}
+}
+
+// TestGoChecksProvisionsPinnedBeadsForGatedContractTests covers R5-10: the
+// beads-export-reconcile contract tests skip unless DAP_BD_BINARY names the
+// exact Beads 1.3.1 binary whose SHA-256 they pin, so go-checks.yml must
+// download the official v1.3.1 release, verify the pinned digest before
+// use, and pass the verified path to the race-test step.
+func TestGoChecksProvisionsPinnedBeadsForGatedContractTests(t *testing.T) {
+	bdTool := manifestTool(t, "bd")
+	pinnedDigest := bdTool.BinarySHA256
+	security, _ := readWorkflow(t, "security-scans.yml")
+	project, _ := readWorkflow(t, "go-checks.yml")
+	if err := validateScannerIsolation(security, project); err != nil {
+		t.Fatalf("unmodified Go checks workflow rejected: %v", err)
+	}
+
+	install := findStep(t, project, "Install pinned Beads for gated contract tests")
+	for _, fragment := range []string{"beads_1.3.1_linux_amd64.tar.gz", pinnedDigest, "sha256sum --check"} {
+		if !strings.Contains(install.Run, fragment) {
+			t.Fatalf("Beads provisioning step run = %q, want it to contain %q", install.Run, fragment)
+		}
+	}
+	// The download must come from the manifest's bd source (the org that
+	// also publishes the checksum file the digest is verified against),
+	// not from a second, independently stated URL.
+	if url := firstURLIn(install.Run); url != bdTool.Source {
+		t.Fatalf("Beads provisioning download URL = %q, want the manifest bd source %q", url, bdTool.Source)
+	}
+	testStep := findStep(t, project, "Test with race detector")
+	if got := testStep.Env["DAP_BD_BINARY"]; got != "${{ runner.temp }}/beads-1.3.1/bd" {
+		t.Fatalf("Test with race detector DAP_BD_BINARY = %q, want the verified provisioning path", got)
+	}
+
+	mutations := []struct {
+		name   string
+		mutate func(*step)
+		step   string
+	}{
+		{"digest verification removed", func(s *step) { s.Run = strings.ReplaceAll(s.Run, "sha256sum --check", "true") }, "Install pinned Beads for gated contract tests"},
+		{"pinned digest changed", func(s *step) { s.Run = strings.ReplaceAll(s.Run, pinnedDigest, strings.Repeat("0", 64)) }, "Install pinned Beads for gated contract tests"},
+		{"gated tests lose the binary path", func(s *step) { delete(s.Env, "DAP_BD_BINARY") }, "Test with race detector"},
+	}
+	for _, tc := range mutations {
+		t.Run(tc.name, func(t *testing.T) {
+			mutated := project
+			mutated.Jobs = cloneJobs(project.Jobs)
+			mutateGoChecksStep(t, &mutated, tc.step, tc.mutate)
+			if err := validateScannerIsolation(security, mutated); err == nil {
+				t.Fatalf("policy accepted Beads provisioning mutation %q", tc.name)
+			}
+		})
+	}
+}
+
+func TestGoChecksNonGateStepsRejectSkipAndFailOpenControls(t *testing.T) {
+	security, _ := readWorkflow(t, "security-scans.yml")
+	project, _ := readWorkflow(t, "go-checks.yml")
+
+	if err := validateScannerIsolation(security, project); err != nil {
+		t.Fatalf("unchanged Go checks workflow was rejected: %v", err)
+	}
+
+	cases := []struct {
+		name     string
+		stepName string
+		mutate   func(*step)
+		control  string
+	}{
+		{
+			name:     "non-gate step cannot be conditional",
+			stepName: "Check formatting",
+			mutate:   func(s *step) { s.If = "${{ false }}" },
+			control:  "if",
+		},
+		{
+			name:     "non-gate step cannot ignore failure",
+			stepName: "Test source publisher guard",
+			mutate:   func(s *step) { s.ContinueOnError = true },
+			control:  "continue-on-error",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			mutated := project
+			mutated.Jobs = cloneJobs(project.Jobs)
+			mutateRun(&mutated, tc.stepName, tc.mutate)
+
+			err := validateScannerIsolation(security, mutated)
+			if err == nil {
+				t.Fatalf("%s on non-gate step %q was accepted", tc.control, tc.stepName)
+			}
+			if !strings.Contains(err.Error(), tc.stepName) {
+				t.Fatalf("rejection %v does not identify pinned step %q", err, tc.stepName)
+			}
+		})
+	}
+}
+
+func TestGoChecksUnnamedStepRejectionIdentifiesPosition(t *testing.T) {
+	security, _ := readWorkflow(t, "security-scans.yml")
+	project, _ := readWorkflow(t, "go-checks.yml")
+	const namedStep = "Check formatting"
+	position := 0
+	for i, candidate := range project.Jobs["checks"].Steps {
+		if candidate.Name == namedStep {
+			position = i + 1
+			break
+		}
+	}
+	if position == 0 {
+		t.Fatalf("workflow step %q not found", namedStep)
+	}
+
+	mutated := project
+	mutated.Jobs = cloneJobs(project.Jobs)
+	mutateRun(&mutated, namedStep, func(s *step) {
+		s.Name = ""
+		s.If = "${{ false }}"
+	})
+
+	err := validateScannerIsolation(security, mutated)
+	if err == nil {
+		t.Fatal("conditional unnamed checks step was accepted")
+	}
+	if !strings.Contains(err.Error(), fmt.Sprintf("step at position %d", position)) {
+		t.Fatalf("rejection %v does not identify unnamed step position %d", err, position)
+	}
+}
+
+// TestGoChecksGateStepsRejectSkipAndFailOpenControls checks that a required
+// gate cannot be skipped with `if:` or made fail-open with
+// `continue-on-error:`. The latter does not skip execution; it weakens failure
+// propagation from the step. The gate body pin (name/working-directory/run)
+// remains byte-identical in both cases, so the validator must inspect the
+// parsed control fields.
+func TestGoChecksGateStepsRejectSkipAndFailOpenControls(t *testing.T) {
+	const gate = "Test with race detector"
+	security, _ := readWorkflow(t, "security-scans.yml")
+	project, _ := readWorkflow(t, "go-checks.yml")
+
+	t.Run("if-guarded gate step is rejected", func(t *testing.T) {
+		mutated := project
+		mutated.Jobs = cloneJobs(project.Jobs)
+		mutateRun(&mutated, gate, func(s *step) { s.If = "${{ false }}" })
+		err := validateScannerIsolation(security, mutated)
+		if err == nil {
+			t.Fatal("if-guarded go-checks gate step was accepted")
+		}
+		if !strings.Contains(err.Error(), gate) {
+			t.Fatalf("rejection did not name the step: %v", err)
+		}
+	})
+
+	t.Run("continue-on-error gate step is rejected", func(t *testing.T) {
+		mutated := project
+		mutated.Jobs = cloneJobs(project.Jobs)
+		mutateRun(&mutated, gate, func(s *step) { s.ContinueOnError = true })
+		err := validateScannerIsolation(security, mutated)
+		if err == nil {
+			t.Fatal("continue-on-error go-checks gate step was accepted")
+		}
+		if !strings.Contains(err.Error(), gate) {
+			t.Fatalf("rejection did not name the step: %v", err)
+		}
+	})
+}
+
+func TestTraceabilityCheckGateIsRequiredAndFailClosed(t *testing.T) {
+	const gate = "Check traceability catalog"
+	security, _ := readWorkflow(t, "security-scans.yml")
+	project, _ := readWorkflow(t, "go-checks.yml")
+	if err := validateScannerIsolation(security, project); err != nil {
+		t.Fatalf("unmodified Go checks workflow rejected: %v", err)
+	}
+	index := -1
+	for i, candidate := range project.Jobs["checks"].Steps {
+		if candidate.Name == gate {
+			index = i
+			if candidate.Run != "go run ./cmd/traceability-check" {
+				t.Fatalf("traceability gate command = %q", candidate.Run)
+			}
+			break
+		}
+	}
+	if index < 0 {
+		t.Fatalf("go-checks workflow is missing the %q gate", gate)
+	}
+	mutations := []struct {
+		name   string
+		mutate func(*testing.T, *workflow)
+	}{
+		{"removed", func(t *testing.T, w *workflow) {
+			checks := w.Jobs["checks"]
+			checks.Steps = append(checks.Steps[:index], checks.Steps[index+1:]...)
+			w.Jobs["checks"] = checks
+		}},
+		{"reordered", func(t *testing.T, w *workflow) {
+			checks := w.Jobs["checks"]
+			checks.Steps[index], checks.Steps[index-1] = checks.Steps[index-1], checks.Steps[index]
+			w.Jobs["checks"] = checks
+		}},
+		{"command changed", func(t *testing.T, w *workflow) {
+			mutateGoChecksStep(t, w, gate, func(s *step) { s.Run = "printf 'traceability skipped'" })
+		}},
+		{"conditional", func(t *testing.T, w *workflow) {
+			mutateGoChecksStep(t, w, gate, func(s *step) { s.If = "${{ false }}" })
+		}},
+		{"continue-on-error", func(t *testing.T, w *workflow) {
+			mutateGoChecksStep(t, w, gate, func(s *step) { s.ContinueOnError = true })
+		}},
+	}
+	for _, tc := range mutations {
+		t.Run(tc.name, func(t *testing.T) {
+			mutated := project
+			mutated.Jobs = cloneJobs(project.Jobs)
+			tc.mutate(t, &mutated)
+			if err := validateScannerIsolation(security, mutated); err == nil {
+				t.Fatal("policy accepted traceability gate mutation")
+			}
+		})
+	}
+}
+
+// TestGoChecksJobRejectsSkipAndFailOpenControls checks that a job-level `if:`
+// cannot skip the required checks job and job-level `continue-on-error:` cannot
+// hide its failed status. The latter does not stop the job's steps from
+// executing. Both fields are parsed on the job struct and must be inspected by
+// the policy.
+func TestGoChecksJobRejectsSkipAndFailOpenControls(t *testing.T) {
+	security, _ := readWorkflow(t, "security-scans.yml")
+	project, _ := readWorkflow(t, "go-checks.yml")
+
+	t.Run("if-guarded checks job is rejected", func(t *testing.T) {
+		mutated := project
+		mutated.Jobs = cloneJobs(project.Jobs)
+		checks := mutated.Jobs["checks"]
+		checks.If = "${{ false }}"
+		mutated.Jobs["checks"] = checks
+		err := validateScannerIsolation(security, mutated)
+		if err == nil {
+			t.Fatal("if-guarded go-checks checks job was accepted")
+		}
+		if !strings.Contains(err.Error(), "checks") {
+			t.Fatalf("rejection did not name the job: %v", err)
+		}
+	})
+
+	t.Run("continue-on-error checks job is rejected", func(t *testing.T) {
+		mutated := project
+		mutated.Jobs = cloneJobs(project.Jobs)
+		checks := mutated.Jobs["checks"]
+		checks.ContinueOnError = true
+		mutated.Jobs["checks"] = checks
+		err := validateScannerIsolation(security, mutated)
+		if err == nil {
+			t.Fatal("continue-on-error go-checks checks job was accepted")
+		}
+		if !strings.Contains(err.Error(), "checks") {
+			t.Fatalf("rejection did not name the job: %v", err)
+		}
+	})
+}
+
+// TestGoChecksJobRejectsUnsupportedExecutionSettings checks YAML-level job and
+// step settings that the policy intentionally rejects. Job-level `env`,
+// `defaults`, and `container` are supported workflow keys that could change
+// gate execution or its runner; step-level `container` is unsupported GitHub
+// Actions syntax, so that case tests defensive rejection and does not claim
+// that an attacker image can run at step scope. The pinned go-checks.yml uses
+// none of these settings.
+func TestGoChecksJobRejectsUnsupportedExecutionSettings(t *testing.T) {
+	security, _ := readWorkflow(t, "security-scans.yml")
+	_, raw := readWorkflow(t, "go-checks.yml")
+	const gate = "Test with race detector"
+
+	cases := []struct {
+		name   string
+		anchor string
+		insert string
+		wantIn string
+	}{
+		{
+			name:   "job-level env is rejected",
+			anchor: "  checks:\n    runs-on: ubuntu-24.04\n    timeout-minutes: 20\n",
+			insert: "    env:\n      GOFLAGS: -run=^$\n",
+			wantIn: "checks",
+		},
+		{
+			name:   "job-level defaults is rejected",
+			anchor: "  checks:\n    runs-on: ubuntu-24.04\n    timeout-minutes: 20\n",
+			insert: "    defaults:\n      run:\n        shell: sh\n",
+			wantIn: "checks",
+		},
+		{
+			name:   "job-level container map is rejected",
+			anchor: "  checks:\n    runs-on: ubuntu-24.04\n    timeout-minutes: 20\n",
+			insert: "    container:\n      image: ghcr.io/attacker/runner:latest\n",
+			wantIn: "checks",
+		},
+		{
+			name:   "step-level container map is rejected",
+			anchor: "      - name: Test with race detector\n",
+			insert: "        container:\n          image: ghcr.io/attacker/runner:latest\n",
+			wantIn: gate,
+		},
+		{
+			name:   "step-level container string is rejected",
+			anchor: "      - name: Test with race detector\n",
+			insert: "        container: ghcr.io/attacker/runner:latest\n",
+			wantIn: gate,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			mutated := strings.Replace(raw, tc.anchor, tc.anchor+tc.insert, 1)
+			if mutated == raw {
+				t.Fatalf("anchor not found for %s", tc.name)
+			}
+			var project workflow
+			if err := yaml.Unmarshal([]byte(mutated), &project); err != nil {
+				t.Fatal(err)
+			}
+			err := validateScannerIsolation(security, project)
+			if err == nil {
+				t.Fatalf("%s was accepted", tc.name)
+			}
+			if !strings.Contains(err.Error(), tc.wantIn) {
+				t.Fatalf("rejection did not name the job/step: %v", err)
+			}
+		})
+	}
+}
+
+// HOLE 1 regression control: a `needs`-based job skip used to bypass policy
+// validation. GitHub skips every job whose needed job is skipped, so a skipped
+// precheck could have suppressed all nine gates. `needs` is parsed on the job
+// struct as `any`; validateScannerIsolation now rejects every non-empty value.
+// Constructed at YAML level to exercise this workflow input. The pinned
+// go-checks.yml uses no `needs`.
+func TestGoChecksJobRejectsNeedsOnChecksJob(t *testing.T) {
+	security, _ := readWorkflow(t, "security-scans.yml")
+	_, raw := readWorkflow(t, "go-checks.yml")
+
+	mutated := strings.Replace(raw, "jobs:\n", "jobs:\n  precheck:\n    runs-on: ubuntu-latest\n    if: ${{ false }}\n    steps:\n      - run: echo precheck\n", 1)
+	if mutated == raw {
+		t.Fatal("jobs anchor not found")
+	}
+	checksAnchor := "  checks:\n    runs-on: ubuntu-24.04\n    timeout-minutes: 20\n"
+	mutated = strings.Replace(mutated, checksAnchor, checksAnchor+"    needs: [precheck]\n", 1)
+	if !strings.Contains(mutated, "needs: [precheck]") {
+		t.Fatal("checks anchor not found")
+	}
+	var project workflow
+	if err := yaml.Unmarshal([]byte(mutated), &project); err != nil {
+		t.Fatal(err)
+	}
+	err := validateScannerIsolation(security, project)
+	if err == nil {
+		t.Fatal("checks job with needs on a skipped precheck job was accepted")
+	}
+	if !strings.Contains(err.Error(), "checks") {
+		t.Fatalf("rejection did not name the job: %v", err)
+	}
+}
+
+// HOLE 2 regression control: top-level workflow `env:` is a modeled GitHub
+// Actions key. This negative control verifies that policy rejects it when it sets
+// `GOFLAGS=-run=^$`, which filters tests from `go test` but does not disable
+// its vet analysis or the separate `go vet` gate. Constructed at YAML level.
+func TestGoChecksWorkflowRejectsTopLevelEnv(t *testing.T) {
+	security, _ := readWorkflow(t, "security-scans.yml")
+	_, raw := readWorkflow(t, "go-checks.yml")
+
+	anchor := "permissions:\n  contents: read\n"
+	insert := "\nenv:\n  GOFLAGS: -run=^$\n"
+	mutated := strings.Replace(raw, anchor, anchor+insert, 1)
+	if mutated == raw {
+		t.Fatal("anchor not found")
+	}
+	var project workflow
+	if err := yaml.Unmarshal([]byte(mutated), &project); err != nil {
+		t.Fatal(err)
+	}
+	err := validateScannerIsolation(security, project)
+	if err == nil {
+		t.Fatal("workflow with top-level env GOFLAGS=-run=^$ was accepted")
+	}
+	if !strings.Contains(err.Error(), "Go checks") {
+		t.Fatalf("rejection did not name the workflow: %v", err)
+	}
+}
+
+// HOLE 3 regression control: GitHub applies workflow-level `defaults` to all
+// jobs, so `defaults.run.shell` or `defaults.run.working-directory` can alter
+// pinned gate execution. The workflow struct models this field and
+// validateScannerIsolation now rejects it. Constructed at YAML level.
+func TestGoChecksWorkflowRejectsTopLevelDefaults(t *testing.T) {
+	security, _ := readWorkflow(t, "security-scans.yml")
+	_, raw := readWorkflow(t, "go-checks.yml")
+
+	cases := []struct {
+		name   string
+		insert string
+	}{
+		{
+			name:   "workflow-level defaults run shell is rejected",
+			insert: "\ndefaults:\n  run:\n    shell: sh\n",
+		},
+		{
+			name:   "workflow-level defaults run working-directory is rejected",
+			insert: "\ndefaults:\n  run:\n    working-directory: ci/decoy\n",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			anchor := "permissions:\n  contents: read\n"
+			mutated := strings.Replace(raw, anchor, anchor+tc.insert, 1)
+			if mutated == raw {
+				t.Fatalf("anchor not found for %s", tc.name)
+			}
+			var project workflow
+			if err := yaml.Unmarshal([]byte(mutated), &project); err != nil {
+				t.Fatal(err)
+			}
+			err := validateScannerIsolation(security, project)
+			if err == nil {
+				t.Fatalf("%s was accepted", tc.name)
+			}
+			if !strings.Contains(err.Error(), "Go checks") {
+				t.Fatalf("rejection did not name the workflow: %v", err)
+			}
+		})
+	}
+}
+
+func TestGoChecksJobPinsCompleteStepInventoryAndOrder(t *testing.T) {
+	security, _ := readWorkflow(t, "security-scans.yml")
+	project, _ := readWorkflow(t, "go-checks.yml")
+	if err := validateScannerIsolation(security, project); err != nil {
+		t.Fatalf("unmodified Go checks workflow rejected: %v", err)
+	}
+
+	mutations := []struct {
+		name   string
+		mutate func(*testing.T, *workflow)
+	}{
+		{
+			name: "added persistent Go configuration step",
+			mutate: func(t *testing.T, w *workflow) {
+				checks := w.Jobs["checks"]
+				checks.Steps = append(checks.Steps, step{Name: "Configure Go persistently", Run: "go env -w GOFLAGS=-run=^$"})
+				w.Jobs["checks"] = checks
+			},
+		},
+		{
+			name: "reordered setup steps",
+			mutate: func(t *testing.T, w *workflow) {
+				checks := w.Jobs["checks"]
+				checks.Steps[0], checks.Steps[1] = checks.Steps[1], checks.Steps[0]
+				w.Jobs["checks"] = checks
+			},
+		},
+		{
+			name: "Poppler provenance test moved after live install",
+			mutate: func(t *testing.T, w *workflow) {
+				checks := w.Jobs["checks"]
+				installIndex, provenanceIndex := -1, -1
+				for i, candidate := range checks.Steps {
+					switch candidate.Name {
+					case "Install poppler-utils":
+						installIndex = i
+					case "Test pinned Poppler acquisition provenance":
+						provenanceIndex = i
+					}
+				}
+				if installIndex < 0 || provenanceIndex < 0 {
+					t.Fatal("Poppler install and provenance fixture steps are required before mutation")
+				}
+				checks.Steps[installIndex], checks.Steps[provenanceIndex] = checks.Steps[provenanceIndex], checks.Steps[installIndex]
+				w.Jobs["checks"] = checks
+			},
+		},
+		{
+			name: "non-gate step removed",
+			mutate: func(t *testing.T, w *workflow) {
+				checks := w.Jobs["checks"]
+				for i, candidate := range checks.Steps {
+					if candidate.Name == "Install poppler-utils" {
+						checks.Steps = append(checks.Steps[:i], checks.Steps[i+1:]...)
+						w.Jobs["checks"] = checks
+						return
+					}
+				}
+				t.Fatal("Install poppler-utils fixture step is missing before mutation")
+			},
+		},
+		{
+			name: "non-gate step renamed",
+			mutate: func(t *testing.T, w *workflow) {
+				mutateGoChecksStep(t, w, "Install poppler-utils", func(s *step) { s.Name = "Install alternate tools" })
+			},
+		},
+		{
+			name: "checkout action reference changed",
+			mutate: func(t *testing.T, w *workflow) {
+				mutateGoChecksStep(t, w, "Check out repository", func(s *step) { s.Uses = "actions/checkout@v7" })
+			},
+		},
+		{
+			name: "Install poppler-utils repurposed",
+			mutate: func(t *testing.T, w *workflow) {
+				mutateGoChecksStep(t, w, "Install poppler-utils", func(s *step) { s.Run = "go env -w GOFLAGS=-run=^$" })
+			},
+		},
+		{
+			name: "run command with leading whitespace",
+			mutate: func(t *testing.T, w *workflow) {
+				mutateGoChecksStep(t, w, "Install poppler-utils", func(s *step) { s.Run = "\n" + s.Run })
+			},
+		},
+		{
+			name: "run command with trailing whitespace",
+			mutate: func(t *testing.T, w *workflow) {
+				mutateGoChecksStep(t, w, "Install poppler-utils", func(s *step) { s.Run += " \n" })
+			},
+		},
+		{
+			name: "non-gate working directory changed",
+			mutate: func(t *testing.T, w *workflow) {
+				mutateGoChecksStep(t, w, "Set up Go", func(s *step) { s.WorkingDirectory = "ci/pdfua2/adapter" })
+			},
+		},
+		{
+			name: "checkout input changed",
+			mutate: func(t *testing.T, w *workflow) {
+				mutateGoChecksStep(t, w, "Check out repository", func(s *step) { s.With["persist-credentials"] = true })
+			},
+		},
+	}
+	for _, tc := range mutations {
+		t.Run(tc.name, func(t *testing.T) {
+			mutated := project
+			mutated.Jobs = cloneJobs(project.Jobs)
+			tc.mutate(t, &mutated)
+			if err := validateScannerIsolation(security, mutated); err == nil {
+				t.Fatal("policy accepted a changed Go checks step inventory or non-gate configuration")
+			}
+		})
+	}
+}
+
+func TestGoChecksPinsUbuntuRunnerForNoblePoppler(t *testing.T) {
+	security, _ := readWorkflow(t, "security-scans.yml")
+	project, _ := readWorkflow(t, "go-checks.yml")
+	if err := validateScannerIsolation(security, project); err != nil {
+		t.Fatalf("unmodified Go checks workflow rejected: %v", err)
+	}
+
+	for _, runner := range []string{"ubuntu-latest", "ubuntu-26.04"} {
+		t.Run(runner, func(t *testing.T) {
+			mutated := project
+			mutated.Jobs = cloneJobs(project.Jobs)
+			checks := mutated.Jobs["checks"]
+			checks.RunsOn = runner
+			mutated.Jobs["checks"] = checks
+			if err := validateScannerIsolation(security, mutated); err == nil {
+				t.Fatalf("policy accepted Noble Poppler pin on runner %q", runner)
+			}
+		})
+	}
+}
+
+func TestGoChecksNonGateStepsRejectEnvironmentAndShellOverrides(t *testing.T) {
+	security, _ := readWorkflow(t, "security-scans.yml")
+	project, _ := readWorkflow(t, "go-checks.yml")
+	if err := validateScannerIsolation(security, project); err != nil {
+		t.Fatalf("unmodified Go checks workflow rejected: %v", err)
+	}
+
+	gateNames := make(map[string]bool, len(requiredGoChecksSteps))
+	for _, gate := range requiredGoChecksSteps {
+		if gate.moduleGate {
+			gateNames[gate.name] = true
+		}
+	}
+	nonGateNames := make([]string, 0)
+	for _, candidate := range project.Jobs["checks"].Steps {
+		if !gateNames[candidate.Name] {
+			nonGateNames = append(nonGateNames, candidate.Name)
+		}
+	}
+	if len(nonGateNames) != 10 {
+		t.Fatalf("non-gate fixture step count = %d, want 10", len(nonGateNames))
+	}
+
+	for _, name := range nonGateNames {
+		for _, field := range []string{"env", "shell"} {
+			name, field := name, field
+			t.Run(name+" rejects "+field, func(t *testing.T) {
+				mutated := project
+				mutated.Jobs = cloneJobs(project.Jobs)
+				mutateGoChecksStep(t, &mutated, name, func(s *step) {
+					if field == "env" {
+						s.Env = map[string]string{"GOFLAGS": "-run=^$"}
+					} else {
+						s.Shell = "bash"
+					}
+				})
+				if err := validateScannerIsolation(security, mutated); err == nil {
+					t.Fatalf("policy accepted non-gate step %q with step-level %s override", name, field)
+				}
+			})
+		}
+	}
+}
+
+func mutateGoChecksStep(t *testing.T, w *workflow, name string, mutate func(*step)) {
+	t.Helper()
+	checks, ok := w.Jobs["checks"]
+	if !ok {
+		t.Fatal("Go checks job is missing before mutation")
+	}
+	for i := range checks.Steps {
+		if checks.Steps[i].Name == name {
+			mutate(&checks.Steps[i])
+			w.Jobs["checks"] = checks
+			return
+		}
+	}
+	t.Fatalf("Go checks fixture step %q is missing before mutation", name)
+}
+
+func TestProjectWorkspaceMutationCannotChangeScannerToolSelection(t *testing.T) {
+	scannerRunnerTemp := t.TempDir()
+	scannerTools := filepath.Join(scannerRunnerTemp, "security-tools")
+	projectRunnerWorkspace := t.TempDir()
+	projectBin := filepath.Join(projectRunnerWorkspace, "bin")
+	for _, dir := range []string{scannerTools, projectBin} {
+		if err := os.MkdirAll(dir, 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	scannerTool := filepath.Join(scannerTools, "govulncheck")
+	projectTool := filepath.Join(projectBin, "govulncheck")
+	if err := os.WriteFile(scannerTool, []byte("#!/bin/sh\nprintf '%s\\n' scanner-pinned-tool\n"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(projectTool, []byte("#!/bin/sh\nprintf '%s\\n' project-tool\n"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+
+	// Model a PR-controlled project test replacing its own same-named tool.
+	if err := os.WriteFile(projectTool, []byte("#!/bin/sh\nprintf '%s\\n' project-replaced-tool\n"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+
+	projectCmd := exec.Command("/bin/sh", "-c", "govulncheck")
+	projectCmd.Env = append(os.Environ(), "PATH="+projectBin+string(os.PathListSeparator)+"/usr/bin:/bin")
+	projectOutput, err := projectCmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("run project-selected dummy tool: %v; output: %s", err, projectOutput)
+	}
+	if got := strings.TrimSpace(string(projectOutput)); got != "project-replaced-tool" {
+		t.Fatalf("project PATH selected %q, want project-replaced-tool", got)
+	}
+
+	cmd := exec.Command("/bin/sh", "-c", "govulncheck")
+	cmd.Env = append(os.Environ(), "PATH="+scannerTools+string(os.PathListSeparator)+projectBin+string(os.PathListSeparator)+"/usr/bin:/bin")
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("run scanner-selected tool: %v; output: %s", err, output)
+	}
+	if got := strings.TrimSpace(string(output)); got != "scanner-pinned-tool" {
+		t.Fatalf("scanner PATH selected %q after project workspace mutation; want scanner-pinned-tool", got)
+	}
+}
+
+func TestGoWorkflowDefinesBoundedTimeout(t *testing.T) {
+	got, raw := readWorkflow(t, "go-checks.yml")
+	if err := validateJobTimeouts(got); err != nil {
+		t.Fatalf("Go checks workflow must have a valid timeout: %v", err)
+	}
+	configured := got.Jobs["checks"].TimeoutMinutes
+	if configured < 5 || configured > 30 {
+		t.Fatalf("Go checks timeout = %d minutes, want 5..30", configured)
+	}
+	mutations := []struct {
+		name string
+		raw  string
+	}{
+		{"missing timeout", strings.Replace(raw, "    timeout-minutes: 20\n", "", 1)},
+		{"timeout too large", strings.Replace(raw, "    timeout-minutes: 20\n", "    timeout-minutes: 31\n", 1)},
+		{"timeout too small", strings.Replace(raw, "    timeout-minutes: 20\n", "    timeout-minutes: 4\n", 1)},
+	}
+	for _, tc := range mutations {
+		t.Run(tc.name, func(t *testing.T) {
+			var mutated workflow
+			if err := yaml.Unmarshal([]byte(tc.raw), &mutated); err != nil {
+				t.Fatal(err)
+			}
+			if err := validateJobTimeouts(mutated); err == nil {
+				t.Fatalf("policy accepted %s", tc.name)
+			}
+		})
+	}
+}
+
+func TestTimeoutCancellationProbeMatchesGoChecksBound(t *testing.T) {
+	goChecks, _ := readWorkflow(t, "go-checks.yml")
+	probe, raw := readWorkflow(t, "timeout-cancellation-probe.yml")
+	productionBound := goChecks.Jobs["checks"].TimeoutMinutes
+	if err := validateTimeoutCancellationProbe(probe, productionBound); err != nil {
+		t.Fatalf("timeout cancellation probe must exercise the Go checks bound: %v", err)
+	}
+
+	mutations := []struct {
+		name string
+		edit func(*workflow)
+	}{
+		{"timeout differs from production", func(w *workflow) {
+			job := w.Jobs["probe"]
+			job.TimeoutMinutes--
+			w.Jobs["probe"] = job
+		}},
+		{"probe no longer stalls past the bound", func(w *workflow) {
+			job := w.Jobs["probe"]
+			job.Steps[0].Run = "sleep 19m"
+			w.Jobs["probe"] = job
+		}},
+		{"compound sleep duration is unsupported", func(w *workflow) {
+			job := w.Jobs["probe"]
+			job.Steps[0].Run = "sleep 25m0s"
+			w.Jobs["probe"] = job
+		}},
+		{"branch pushes can run the probe automatically", func(w *workflow) { w.On["push"] = map[string]any{"branches": []any{"**"}} }},
+		{"tag pushes can run the probe automatically", func(w *workflow) { w.On["push"] = map[string]any{"tags": []any{"v*"}} }},
+		{"job condition can skip the probe", func(w *workflow) {
+			job := w.Jobs["probe"]
+			job.If = "false"
+			w.Jobs["probe"] = job
+		}},
+		{"step condition can skip the stall", func(w *workflow) {
+			job := w.Jobs["probe"]
+			job.Steps[0].If = "false"
+			w.Jobs["probe"] = job
+		}},
+		{"step timeout can expire before the job bound", func(w *workflow) {
+			job := w.Jobs["probe"]
+			job.Steps[0].TimeoutMinutes = 5
+			w.Jobs["probe"] = job
+		}},
+		{"job can ignore timeout failure", func(w *workflow) {
+			job := w.Jobs["probe"]
+			job.ContinueOnError = true
+			w.Jobs["probe"] = job
+		}},
+		{"step can ignore timeout failure", func(w *workflow) {
+			job := w.Jobs["probe"]
+			job.Steps[0].ContinueOnError = true
+			w.Jobs["probe"] = job
+		}},
+		{"probe can depend on a missing job", func(w *workflow) {
+			job := w.Jobs["probe"]
+			job.Needs = []string{"missing"}
+			w.Jobs["probe"] = job
+		}},
+	}
+	for _, tc := range mutations {
+		t.Run(tc.name, func(t *testing.T) {
+			var mutated workflow
+			if err := yaml.Unmarshal([]byte(raw), &mutated); err != nil {
+				t.Fatal(err)
+			}
+			tc.edit(&mutated)
+			if err := validateTimeoutCancellationProbe(mutated, productionBound); err == nil {
+				t.Fatalf("policy accepted %s", tc.name)
+			}
+		})
+	}
+
+	var upperBound workflow
+	if err := yaml.Unmarshal([]byte(raw), &upperBound); err != nil {
+		t.Fatal(err)
+	}
+	job := upperBound.Jobs["probe"]
+	job.TimeoutMinutes = 30
+	upperBound.Jobs["probe"] = job
+	if err := validateTimeoutCancellationProbe(upperBound, 30); err == nil {
+		t.Fatal("policy accepted a 25-minute stall for a 30-minute production timeout")
+	}
+}
+
+func TestPinnedStepsRejectEnvAndShellOverrides(t *testing.T) {
+	// Regression test: step-level env/shell alter execution without tripping
+	// the body pin. A rewritten step could keep the pinned body while smuggling
+	// behavior through these keys, so the validators must pin them per step.
+	t.Run("project step env override rejected", func(t *testing.T) {
+		_, raw := readWorkflow(t, "go-checks.yml")
+		mutated := strings.Replace(raw,
+			"DAP_BEADS_SOURCE_REF: ${{ github.event.pull_request.base.sha || github.event.before }}",
+			"GOTOOLCHAIN: local",
+			1)
+		var project workflow
+		if err := yaml.Unmarshal([]byte(mutated), &project); err != nil {
+			t.Fatal(err)
+		}
+		security, _ := readWorkflow(t, "security-scans.yml")
+		err := validateScannerIsolation(security, project)
+		if err == nil {
+			t.Fatal("step-level env override on a pinned project step was accepted")
+		}
+		if !strings.Contains(err.Error(), "Test with race detector") {
+			t.Fatalf("rejection did not name the step: %v", err)
+		}
+	})
+
+	t.Run("project step shell override rejected", func(t *testing.T) {
+		_, raw := readWorkflow(t, "go-checks.yml")
+		mutated := strings.Replace(raw,
+			"        run: go test -race ./...",
+			"        shell: bash\n        run: go test -race ./...",
+			1)
+		var project workflow
+		if err := yaml.Unmarshal([]byte(mutated), &project); err != nil {
+			t.Fatal(err)
+		}
+		security, _ := readWorkflow(t, "security-scans.yml")
+		err := validateScannerIsolation(security, project)
+		if err == nil {
+			t.Fatal("step-level shell override on a pinned project step was accepted")
+		}
+		if !strings.Contains(err.Error(), "Test with race detector") {
+			t.Fatalf("rejection did not name the step: %v", err)
+		}
+	})
+
+	t.Run("scanner step shell change rejected", func(t *testing.T) {
+		_, raw := readWorkflow(t, "security-scans.yml")
+		mutated := strings.Replace(raw,
+			"      - name: Check test-inclusive dependency licenses\n        shell: bash\n",
+			"      - name: Check test-inclusive dependency licenses\n        shell: sh\n",
+			1)
+		var w workflow
+		if err := yaml.Unmarshal([]byte(mutated), &w); err != nil {
+			t.Fatal(err)
+		}
+		err := validateScannerSteps(w)
+		if err == nil {
+			t.Fatal("shell change on a pinned scanner step was accepted")
+		}
+		if !strings.Contains(err.Error(), "Check test-inclusive dependency licenses") {
+			t.Fatalf("rejection did not name the step: %v", err)
+		}
+	})
+
+	t.Run("scanner step env override rejected", func(t *testing.T) {
+		_, raw := readWorkflow(t, "security-scans.yml")
+		mutated := strings.Replace(raw,
+			"      - name: Check vulnerabilities including tests\n        run: govulncheck -test ./...",
+			"      - name: Check vulnerabilities including tests\n        env:\n          GOFLAGS: -mod=mod\n        run: govulncheck -test ./...",
+			1)
+		var w workflow
+		if err := yaml.Unmarshal([]byte(mutated), &w); err != nil {
+			t.Fatal(err)
+		}
+		err := validateScannerSteps(w)
+		if err == nil {
+			t.Fatal("step-level env override on a pinned scanner step was accepted")
+		}
+		if !strings.Contains(err.Error(), "Check vulnerabilities including tests") {
+			t.Fatalf("rejection did not name the step: %v", err)
+		}
+	})
+
+	t.Run("probe step env override rejected", func(t *testing.T) {
+		_, raw := readWorkflow(t, "timeout-cancellation-probe.yml")
+		mutated := strings.Replace(raw,
+			"      - name: Stall beyond the configured timeout\n        run: sleep 25m",
+			"      - name: Stall beyond the configured timeout\n        env:\n          SLEEP_EXTRA: \"60\"\n        run: sleep 25m",
+			1)
+		var probe workflow
+		if err := yaml.Unmarshal([]byte(mutated), &probe); err != nil {
+			t.Fatal(err)
+		}
+		goChecks, _ := readWorkflow(t, "go-checks.yml")
+		err := validateTimeoutCancellationProbe(probe, goChecks.Jobs["checks"].TimeoutMinutes)
+		if err == nil {
+			t.Fatal("step-level env override on the probe step was accepted")
+		}
+		if !strings.Contains(err.Error(), "Stall beyond the configured timeout") {
+			t.Fatalf("rejection did not name the step: %v", err)
+		}
+	})
+
+	t.Run("env and shell are parsed, not dropped", func(t *testing.T) {
+		got, _ := readWorkflow(t, "security-scans.yml")
+		license := findStep(t, got, "Check test-inclusive dependency licenses")
+		if license.Shell != "bash" {
+			t.Fatalf("license step shell = %q, want %q (shell must be parsed, not dropped)", license.Shell, "bash")
+		}
+		if len(license.Env) != 0 {
+			t.Fatalf("license step env = %v, want empty", license.Env)
+		}
+		verapdf, _ := readWorkflow(t, "verapdf-integration.yml")
+		image := findStep(t, verapdf, "Pull the verified official Temurin base and build a local validator image")
+		if !strings.HasPrefix(image.Env["BASE_IMAGE"], "eclipse-temurin:21.0.12.1_1-jre-noble@sha256:") {
+			t.Fatalf("validator image step BASE_IMAGE = %q, want the pinned digest reference (env must be parsed, not dropped)", image.Env["BASE_IMAGE"])
+		}
+	})
+}
+
+func validateTimeoutCancellationProbe(probe workflow, productionBound int) error {
+	if productionBound < 1 || len(probe.Jobs) != 1 {
+		return fmt.Errorf("probe must define exactly one job and production must have a timeout")
+	}
+	job, ok := probe.Jobs["probe"]
+	if !ok || job.TimeoutMinutes != productionBound {
+		return fmt.Errorf("probe timeout must match Go checks timeout of %d minutes", productionBound)
+	}
+	if strings.TrimSpace(job.If) != "" || job.ContinueOnError || job.Needs != nil || len(job.Steps) != 1 {
+		return fmt.Errorf("probe must sleep longer than the configured timeout")
+	}
+	if strings.TrimSpace(job.Steps[0].If) != "" || job.Steps[0].ContinueOnError {
+		return fmt.Errorf("probe stall must not be skipped or ignored")
+	}
+	if job.Steps[0].Shell != "" || len(job.Steps[0].Env) != 0 {
+		return fmt.Errorf("probe step %q must not set shell or step-level env", job.Steps[0].Name)
+	}
+	if job.Steps[0].TimeoutMinutes != 0 && job.Steps[0].TimeoutMinutes < productionBound {
+		return fmt.Errorf("probe step timeout must not expire before the configured job timeout")
+	}
+	command := strings.TrimSpace(job.Steps[0].Run)
+	sleepMatch := probeSleepPattern.FindStringSubmatch(command)
+	if len(sleepMatch) != 2 {
+		return fmt.Errorf("probe must sleep longer than the configured timeout")
+	}
+	stallMinutes, err := strconv.Atoi(sleepMatch[1])
+	if err != nil || stallMinutes <= productionBound {
+		return fmt.Errorf("probe stall must exceed the configured timeout of %d minutes", productionBound)
+	}
+	if len(probe.On) != 1 {
+		return fmt.Errorf("probe must have only a manual workflow_dispatch trigger")
+	}
+	if _, ok := probe.On["workflow_dispatch"]; !ok {
+		return fmt.Errorf("probe must be manually dispatched")
+	}
+	return nil
+}
+
+func TestWorkflowPolicyRejectsMutableActionsAndWritePermissions(t *testing.T) {
+	got, raw := readWorkflow(t, "security-scans.yml")
+	if err := validateWorkflow(got); err != nil {
+		t.Fatal(err)
+	}
+	if err := validateActionPins(got, raw); err != nil {
+		t.Fatal(err)
+	}
+
+	mutable := got
+	mutable.Jobs = cloneJobs(got.Jobs)
+	mutateUse(&mutable, "Checkout repository", "actions/checkout@v7")
+	if err := validateActionPins(mutable, raw); err == nil {
+		t.Fatal("mutable action tag accepted")
+	}
+
+	writable := got
+	writable.Permissions = map[string]string{"contents": "write"}
+	if err := validateWorkflow(writable); err == nil {
+		t.Fatal("write permission accepted")
+	}
+
+	withoutCancellation := got
+	withoutCancellation.Concurrency.CancelInProgress = false
+	if err := validateWorkflow(withoutCancellation); err == nil {
+		t.Fatal("workflow without cancellation accepted")
+	}
+
+	wrongBranch := got
+	wrongBranch.On = cloneEvents(got.On)
+	wrongBranch.On["pull_request"].(map[string]any)["branches"] = []any{"release"}
+	if err := validateMainAndWeeklyTriggers(wrongBranch.On); err == nil {
+		t.Fatal("pull request trigger outside main accepted")
+	}
+
+	noSchedule := got
+	noSchedule.On = cloneEvents(got.On)
+	delete(noSchedule.On, "schedule")
+	if err := validateMainAndWeeklyTriggers(noSchedule.On); err == nil {
+		t.Fatal("missing weekly scan trigger accepted")
+	}
+}
+
+func TestSecretWorkflowScansAllHistoryWithRedactedOutput(t *testing.T) {
+	got, raw := readWorkflow(t, "security-scans.yml")
+	if err := validateActionPins(got, raw); err != nil {
+		t.Fatal(err)
+	}
+	if err := validateMainAndWeeklyTriggers(got.On); err != nil {
+		t.Fatal(err)
+	}
+	checkout := findStep(t, got, "Checkout repository")
+	if checkout.With["persist-credentials"] != false {
+		t.Fatal("checkout must not persist credentials")
+	}
+	secretJob, ok := got.Jobs["secrets"]
+	if !ok {
+		t.Fatal("missing full-history secret-scan job")
+	}
+	if secretJob.Permissions != nil {
+		t.Fatal("secret-scan job must use only workflow-level read permissions")
+	}
+	fullHistory := false
+	for _, s := range secretJob.Steps {
+		if s.Uses != "" && strings.HasPrefix(s.Uses, "actions/checkout@") && s.With["fetch-depth"] == 0 {
+			fullHistory = true
+		}
+	}
+	if !fullHistory {
+		t.Fatal("Gitleaks checkout must fetch full history")
+	}
+	if err := validateScannerSteps(got); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestExceptionConfigAndMetadataPolicy(t *testing.T) {
+	data, err := os.ReadFile(filepath.Join("..", "..", ".security", "secret-exceptions.yaml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var config exceptionFile
+	if err := yaml.Unmarshal(data, &config); err != nil {
+		t.Fatalf("parse exception config: %v", err)
+	}
+	if err := validateExceptions(config, time.Now().UTC()); err != nil {
+		t.Fatal(err)
+	}
+	if len(config.Exceptions) != 0 {
+		t.Fatal("no secret exceptions are currently approved")
+	}
+
+	valid := exception{ID: "synthetic-key-example", Paths: []string{"internal/devsecops/testdata/gitleaks/example.txt"}, Rules: []string{"aws-access-token"}, Reason: "Synthetic scanner fixture only", Owner: "security-owner", BeadsID: "dap-jo9.7", Expires: "2026-11-12"}
+	if err := validateExceptions(exceptionFile{Version: 1, Exceptions: []exception{valid}}, time.Date(2026, 10, 12, 0, 0, 0, 0, time.UTC)); err != nil {
+		t.Fatalf("valid synthetic exception rejected: %v", err)
+	}
+
+	badCases := []struct {
+		name   string
+		mutate func(*exception)
+	}{
+		{"expired", func(e *exception) { e.Expires = "2026-10-11" }},
+		{"missing owner", func(e *exception) { e.Owner = "" }},
+		{"missing Beads issue", func(e *exception) { e.BeadsID = "" }},
+		{"invalid Beads issue", func(e *exception) { e.BeadsID = "other-123" }},
+		{"broad non-fixture path", func(e *exception) { e.Paths = []string{"**/*.go"} }},
+		{"missing expiration", func(e *exception) { e.Expires = "" }},
+	}
+	for _, tc := range badCases {
+		t.Run(tc.name, func(t *testing.T) {
+			candidate := valid
+			candidate.Paths = append([]string(nil), valid.Paths...)
+			candidate.Rules = append([]string(nil), valid.Rules...)
+			tc.mutate(&candidate)
+			if err := validateExceptions(exceptionFile{Version: 1, Exceptions: []exception{candidate}}, time.Date(2026, 10, 12, 0, 0, 0, 0, time.UTC)); err == nil {
+				t.Fatal("invalid exception accepted")
+			}
+		})
+	}
+}
+
+func TestExceptionConfigRejectsMalformedYAML(t *testing.T) {
+	var config exceptionFile
+	if err := yaml.Unmarshal([]byte("version: ["), &config); err == nil {
+		t.Fatal("malformed YAML accepted")
+	}
+}
+
+func TestLicenseAllowlistIsExplicitAndRejectsUnknown(t *testing.T) {
+	data, err := os.ReadFile(filepath.Join("..", "..", ".security", "allowed-go-licenses.txt"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	allowed := map[string]bool{}
+	for _, line := range strings.Split(string(data), "\n") {
+		license := strings.TrimSpace(strings.SplitN(line, "#", 2)[0])
+		if license != "" {
+			allowed[license] = true
+		}
+	}
+	for _, license := range []string{"Apache-2.0", "MIT", "BSD-3-Clause"} {
+		if !allowed[license] {
+			t.Errorf("reviewed permissive license %q missing from allowlist", license)
+		}
+	}
+	for _, unapproved := range []string{"", "Unknown", "GPL-3.0", "GPL-3.0-only", "LicenseRef-unreviewed"} {
+		if allowed[unapproved] {
+			t.Errorf("unapproved license %q was allowlisted", unapproved)
+		}
+	}
+}
+
+func TestGitleaksConfigHasNoSuppressionRules(t *testing.T) {
+	data, err := os.ReadFile(filepath.Join("..", "..", ".security", "gitleaks.toml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := validateGitleaksConfig(data); err != nil {
+		t.Fatal(err)
+	}
+	for _, mutated := range [][]byte{
+		append(append([]byte(nil), data...), []byte("\n[allowlist]\npaths = ['**']\n")...),
+		[]byte("[extend]\nuseDefault = false\n"),
+	} {
+		if err := validateGitleaksConfig(mutated); err == nil {
+			t.Fatal("Gitleaks suppression or custom-rule config accepted")
+		}
+	}
+}
+
+func TestGitleaksSmokeCoversRepositorySuppressionBypasses(t *testing.T) {
+	data, err := os.ReadFile(filepath.Join("..", "..", ".github", "scripts", "test-gitleaks.sh"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, required := range []string{".gitleaks.toml", ".gitleaksignore", "config_suppression_status", "ignore_suppression_status", "source_ignore_suppression_status", "check-gitleaks-suppressions.sh", "--gitleaks-ignore-path=/dev/null"} {
+		if !strings.Contains(string(data), required) {
+			t.Errorf("Gitleaks suppression smoke test missing %q", required)
+		}
+	}
+}
+
+func TestGitleaksGuardRejectsUnmanagedSuppressionFiles(t *testing.T) {
+	script := filepath.Join("..", "..", ".github", "scripts", "check-gitleaks-suppressions.sh")
+	for _, name := range []string{".gitleaksignore", ".gitleaks.toml"} {
+		t.Run(name, func(t *testing.T) {
+			root := t.TempDir()
+			candidate := filepath.Join(root, name)
+			if err := os.WriteFile(candidate, []byte("synthetic suppression fixture\n"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			cmd := exec.Command("bash", script, root)
+			if output, err := cmd.CombinedOutput(); err == nil || !strings.Contains(string(output), "prohibited") {
+				t.Fatalf("guard must reject %s; err=%v output=%s", name, err, output)
+			}
+
+			if err := os.Remove(candidate); err != nil {
+				t.Fatal(err)
+			}
+			cmd = exec.Command("bash", script, root)
+			if output, err := cmd.CombinedOutput(); err != nil {
+				t.Fatalf("guard must accept clean fixture; err=%v output=%s", err, output)
+			}
+		})
+	}
+}
+
+func TestGitleaksGuardFailsClosedWhenDiscoveryFails(t *testing.T) {
+	script := filepath.Join("..", "..", ".github", "scripts", "check-gitleaks-suppressions.sh")
+	root := t.TempDir()
+	shimDir := t.TempDir()
+	tempDir := t.TempDir()
+	findShim := filepath.Join(shimDir, "find")
+	findMarker := filepath.Join(shimDir, "find-invoked")
+	if err := os.WriteFile(findShim, []byte("#!/bin/sh\nprintf invoked > \"$FIND_SHIM_MARKER\"\nexit 1\n"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+
+	cmd := exec.Command("bash", script, root)
+	cmd.Env = envWithOverrides(map[string]string{
+		"FIND_SHIM_MARKER": findMarker,
+		"PATH":             shimDir + string(os.PathListSeparator) + os.Getenv("PATH"),
+		"TMPDIR":           tempDir,
+	})
+	if output, err := cmd.CombinedOutput(); err == nil || !strings.Contains(string(output), "Failed to enumerate") {
+		t.Fatalf("guard must report failed suppression discovery; err=%v output=%s", err, output)
+	}
+	if _, err := os.Stat(findMarker); err != nil {
+		t.Fatalf("synthetic find shim was not invoked: %v", err)
+	}
+	if entries, err := os.ReadDir(tempDir); err != nil {
+		t.Fatal(err)
+	} else if len(entries) != 0 {
+		t.Fatalf("guard left temporary discovery files behind: %v", entries)
+	}
+}
+
+func TestLicenseSmokeUsesForbiddenTestOnlyDependency(t *testing.T) {
+	data, err := os.ReadFile(filepath.Join("..", "..", ".github", "scripts", "test-go-licenses.sh"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, required := range []string{"main_test.go", "fixtures/GPL-3.0.txt", "Not allowed license 'GPL-3\\.0'", "--include_tests", "--allowed_licenses=", "replace example.test/forbidden", ".security/allowed-go-licenses.txt", "grep -Ev", "paste -sd, -"} {
+		if !strings.Contains(string(data), required) {
+			t.Errorf("license smoke test missing %q", required)
+		}
+	}
+	if strings.Contains(string(data), "allowed_licenses='Apache-2.0,BSD-3-Clause,MIT'") {
+		t.Error("license smoke test must consume the checked-in production allowlist, not duplicate it")
+	}
+	license, err := os.ReadFile(filepath.Join("..", "..", ".github", "scripts", "fixtures", "GPL-3.0.txt"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(license), "GNU GENERAL PUBLIC LICENSE") || !strings.Contains(string(license), "Version 3, 29 June 2007") {
+		t.Fatal("forbidden-license fixture must contain the full GPL-3.0 license text")
+	}
+}
+
+// TestCheckLicensesScriptCarriesPinnedPolicy pins the policy content of
+// scripts/check-licenses.sh, the single license-check entry point the
+// security workflow now invokes. The workflow pins only the invocation;
+// the test-inclusive invocation, the explicit fail-closed allowlist, and
+// the parity environment that the workflow used to pin inline live in the
+// script, so they are pinned here instead. The two go-licenses lines are
+// required as exact full lines, each exactly once, so a comment or dead
+// code carrying the same text cannot satisfy the pin, and no
+// license-suppression form may appear on a go-licenses line.
+func TestCheckLicensesScriptCarriesPinnedPolicy(t *testing.T) {
+	data, err := os.ReadFile(filepath.Join("..", "..", "scripts", "check-licenses.sh"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	content := string(data)
+	// The pinned invocations are function bodies in the script, so each
+	// line is trimmed of surrounding whitespace before the whole-line
+	// comparison: the comparison is still over the entire line, so a
+	// comment, a longer line merely containing the invocation, or dead
+	// text cannot satisfy it.
+	lines := strings.Split(content, "\n")
+	for i := range lines {
+		lines[i] = strings.TrimSpace(lines[i])
+	}
+
+	exactLines := []string{
+		`(cd "$repo_root" && go-licenses check --include_tests --allowed_licenses="$allowed_licenses" ./...)`,
+		`(cd "$repo_root/ci/pdfua2/adapter" && go-licenses check --include_tests --allowed_licenses="$allowed_licenses" ./...)`,
+	}
+	for _, want := range exactLines {
+		count := 0
+		for _, line := range lines {
+			if line == want {
+				count++
+			}
+		}
+		if count != 1 {
+			t.Errorf("check-licenses script exact line %q appears %d times, want exactly 1", want, count)
+		}
+	}
+	if got := strings.Count(content, `go-licenses check --include_tests --allowed_licenses="$allowed_licenses" ./...`); got != 2 {
+		t.Errorf("shared go-licenses invocation tail appears %d times, want exactly 2", got)
+	}
+
+	for _, required := range []string{
+		"export GOTOOLCHAIN=local",
+		"export GOWORK=off",
+		`export GOROOT="$(go env GOROOT)"`,
+		"go list -m all",
+		"github.com/pratik-saptarshi/document-accessibility-pipeline/cmd/cloud-tools-bootstrap",
+		".security/allowed-go-licenses.txt",
+		`grep -Ev '^[[:space:]]*(#|$)'`,
+		"paste -sd, -",
+		"set -euo pipefail",
+		"check-licenses: allowed license list is empty",
+	} {
+		if !strings.Contains(content, required) {
+			t.Errorf("check-licenses script missing %q", required)
+		}
+	}
+
+	for _, forbidden := range []string{"Apache-2.0", "BSD-3-Clause", "GPL", "--allowed_licenses=*", "set +e"} {
+		if strings.Contains(content, forbidden) {
+			t.Errorf("check-licenses script must not contain %q", forbidden)
+		}
+	}
+	if regexp.MustCompile(`\bMIT\b`).MatchString(content) {
+		t.Error("check-licenses script must not contain the standalone license identifier MIT")
+	}
+	// The install line's go-licenses version is a checked surface: it
+	// must equal the manifest's go-licenses version (the script writes
+	// it with a "v" prefix, the manifest stores it bare).
+	installVersion := regexp.MustCompile(`go-licenses/v2@v([0-9]+\.[0-9]+\.[0-9]+)`).FindStringSubmatch(content)
+	if installVersion == nil {
+		t.Fatal("check-licenses script has no go-licenses install version to check")
+	}
+	if got, want := installVersion[1], manifestTool(t, "go-licenses").Version; got != want {
+		t.Errorf("check-licenses installs go-licenses v%s, want v%s (manifest)", got, want)
+	}
+
+	for _, line := range lines {
+		if !strings.Contains(line, "go-licenses") {
+			continue
+		}
+		for _, forbidden := range []string{"||", "2>/dev/null", "1>/dev/null", ">/dev/null"} {
+			if strings.Contains(line, forbidden) {
+				t.Errorf("go-licenses line %q must not contain %q", line, forbidden)
+			}
+		}
+	}
+}
+
+// TestCheckLicensesBehaviorScriptCoversCases pins the case coverage of
+// .github/scripts/test-check-licenses.sh, the behavior test for
+// scripts/check-licenses.sh that the security workflow runs. Each required
+// substring proves one behavior case exists in the script: the forbidden
+// test-only dependency rejection, the empty-allowlist guard, the bootstrap
+// module-graph assertion, and the workspace-isolation case. The three
+// replace directives that wire the forbidden fixture into each module are
+// pinned as exact full lines, each exactly once: their bare target paths
+// nest ("./forbidden" is a substring of "../../forbidden", which is a
+// substring of "../../../forbidden"), so substring pins stay green when the
+// root fixture's replace line — or Case 2 wholesale — is deleted. The
+// GPL-3.0 message assertion is likewise counted: it must occur exactly
+// twice (Cases 2 and 7), so deleting either case fails this test.
+func TestCheckLicensesBehaviorScriptCoversCases(t *testing.T) {
+	data, err := os.ReadFile(filepath.Join("..", "..", ".github", "scripts", "test-check-licenses.sh"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	content := string(data)
+	for _, required := range []string{
+		`Not allowed license 'GPL-3\.0'`,
+		"fixtures/GPL-3.0.txt",
+		"go.work",
+		"github.com/pratik-saptarshi/document-accessibility-pipeline/cmd/cloud-tools-bootstrap",
+		"check-licenses: allowed license list is empty",
+	} {
+		if !strings.Contains(content, required) {
+			t.Errorf("license behavior test missing %q", required)
+		}
+	}
+	if got := strings.Count(content, `Not allowed license 'GPL-3\.0'`); got != 2 {
+		t.Errorf("license behavior test GPL-3.0 message assertion appears %d times, want exactly 2 (Cases 2 and 7)", got)
+	}
+	lines := strings.Split(content, "\n")
+	for i := range lines {
+		lines[i] = strings.TrimSpace(lines[i])
+	}
+	for _, want := range []string{
+		"replace example.test/forbidden => ./forbidden",
+		"replace example.test/forbidden => ../../forbidden",
+		"replace example.test/forbidden => ../../../forbidden",
+	} {
+		count := 0
+		for _, line := range lines {
+			if line == want {
+				count++
+			}
+		}
+		if count != 1 {
+			t.Errorf("license behavior test exact line %q appears %d times, want exactly 1", want, count)
+		}
+	}
+	if strings.Contains(content, "set +e") {
+		t.Error("license behavior test must not contain \"set +e\"")
+	}
+}
+
+// validateRunnerLabels rejects self-hosted runner labels. Runners are part
+// of the enforcement boundary: scanner and check jobs must stay on
+// GitHub-hosted runners.
+func validateRunnerLabels(w workflow) error {
+	for name, configured := range w.Jobs {
+		if strings.Contains(strings.ToLower(configured.RunsOn), "self-hosted") {
+			return fmt.Errorf("job %s must not run on a self-hosted runner", name)
+		}
+	}
+	return nil
+}
+
+func validateWorkflow(w workflow) error {
+	if strings.TrimSpace(w.Name) == "" || len(w.Jobs) == 0 {
+		return fmt.Errorf("workflow name and jobs are required")
+	}
+	if err := validateRunnerLabels(w); err != nil {
+		return err
+	}
+	if len(w.Permissions) != 1 || w.Permissions["contents"] != "read" {
+		return fmt.Errorf("workflow permissions must be exactly contents: read")
+	}
+	if strings.TrimSpace(w.Concurrency.Group) == "" || !w.Concurrency.CancelInProgress {
+		return fmt.Errorf("workflow must define a concurrency group and cancel superseded runs")
+	}
+	if err := validateJobTimeouts(w); err != nil {
+		return err
+	}
+	for name, configured := range w.Jobs {
+		if strings.TrimSpace(configured.If) != "" {
+			return fmt.Errorf("job %s must not be conditional", name)
+		}
+		if configured.ContinueOnError {
+			return fmt.Errorf("job %s must not continue after failure", name)
+		}
+		if len(configured.Permissions) != 0 {
+			return fmt.Errorf("job %s must not expand workflow permissions", name)
+		}
+	}
+	return nil
+}
+
+func validateJobTimeouts(w workflow) error {
+	for name, configured := range w.Jobs {
+		if configured.TimeoutMinutes < 5 || configured.TimeoutMinutes > 30 {
+			return fmt.Errorf("job %s timeout must be between 5 and 30 minutes", name)
+		}
+	}
+	return nil
+}
+
+func validateActionPins(w workflow, raw string) error {
+	annotation := regexp.MustCompile(`uses:\s+[^\s]+@[0-9a-f]{40}\s+#\s+v[0-9]`)
+	for jobName, configured := range w.Jobs {
+		for _, s := range configured.Steps {
+			if s.Uses == "" {
+				continue
+			}
+			parts := strings.SplitN(s.Uses, "@", 2)
+			if len(parts) != 2 || !actionSHAPattern.MatchString(parts[1]) {
+				return fmt.Errorf("job %s action %q is not pinned to a full commit SHA", jobName, s.Uses)
+			}
+			line := "uses: " + s.Uses
+			found := false
+			for _, candidate := range strings.Split(raw, "\n") {
+				if strings.Contains(candidate, line) && annotation.MatchString(candidate) {
+					found = true
+					break
+				}
+			}
+			if !found {
+				return fmt.Errorf("job %s action %q lacks a version comment", jobName, s.Uses)
+			}
+		}
+	}
+	return nil
+}
+
+func validateMainAndWeeklyTriggers(events map[string]any) error {
+	if len(events) != 3 {
+		return fmt.Errorf("expected push, pull_request, and schedule triggers")
+	}
+	for _, event := range []string{"push", "pull_request"} {
+		config, ok := events[event].(map[string]any)
+		if !ok {
+			return fmt.Errorf("missing %s trigger", event)
+		}
+		branches, ok := config["branches"].([]any)
+		if !ok || len(branches) != 1 || branches[0] != "main" {
+			return fmt.Errorf("%s must target only main", event)
+		}
+	}
+	schedules, ok := events["schedule"].([]any)
+	if !ok || len(schedules) != 1 {
+		return fmt.Errorf("expected one weekly schedule")
+	}
+	schedule, ok := schedules[0].(map[string]any)
+	if !ok || schedule["cron"] != "17 5 * * 1" {
+		return fmt.Errorf("weekly schedule must use the approved Monday 05:17 UTC cadence")
+	}
+	return nil
+}
+
+// shellTokens lexes a shell command string into word and operator tokens.
+// Quoted text contributes its literal contents to the current word, comments
+// are dropped, and shell metacharacters (lists, pipes, redirections, command
+// substitution, grouping) become standalone tokens — including glued forms
+// such as "2>/dev/null", "cmd>/dev/null", and the dup form "2>&1" — so the
+// policy checks below match shell structure instead of substrings.
+func shellTokens(command string) []string {
+	var tokens []string
+	var word strings.Builder
+	started := false
+	flush := func() {
+		if started {
+			tokens = append(tokens, word.String())
+			word.Reset()
+			started = false
+		}
+	}
+	runes := []rune(command)
+	i := 0
+	for i < len(runes) {
+		c := runes[i]
+		switch {
+		case c == '\'' || c == '"':
+			quote := c
+			started = true
+			i++
+			for i < len(runes) && runes[i] != quote {
+				if quote == '"' && runes[i] == '\\' && i+1 < len(runes) {
+					i++
+				}
+				word.WriteRune(runes[i])
+				i++
+			}
+			i++ // closing quote, or one past the end for an unterminated quote
+		case c == '\\' && i+1 < len(runes):
+			word.WriteRune(runes[i+1])
+			started = true
+			i += 2
+		case c == '#' && !started:
+			for i < len(runes) && runes[i] != '\n' {
+				i++
+			}
+		case c == '\n':
+			flush()
+			tokens = append(tokens, "\n")
+			i++
+		case c == ' ' || c == '\t' || c == '\r':
+			flush()
+			i++
+		case c == '$' && i+1 < len(runes) && runes[i+1] == '(':
+			flush()
+			tokens = append(tokens, "$(")
+			i += 2
+		case c == '`':
+			flush()
+			tokens = append(tokens, "`")
+			i++
+		case c == '(' || c == ')' || c == ';':
+			flush()
+			tokens = append(tokens, string(c))
+			i++
+		case c == '|':
+			flush()
+			if i+1 < len(runes) && (runes[i+1] == '|' || runes[i+1] == '&') {
+				if runes[i+1] == '|' {
+					tokens = append(tokens, "||")
+				} else {
+					tokens = append(tokens, "|") // |& pipes both streams; still a pipe
+				}
+				i += 2
+			} else {
+				tokens = append(tokens, "|")
+				i++
+			}
+		case c == '&':
+			flush()
+			switch {
+			case i+1 < len(runes) && runes[i+1] == '&':
+				tokens = append(tokens, "&&")
+				i += 2
+			case i+1 < len(runes) && runes[i+1] == '>':
+				if i+2 < len(runes) && runes[i+2] == '>' {
+					tokens = append(tokens, "&>>")
+					i += 3
+				} else {
+					tokens = append(tokens, "&>")
+					i += 2
+				}
+			default:
+				tokens = append(tokens, "&")
+				i++
+			}
+		case c == '>' || c == '<':
+			prefix := ""
+			if started && isAllDigits(word.String()) {
+				prefix = word.String()
+				word.Reset()
+				started = false
+			} else {
+				flush()
+			}
+			op := string(c)
+			i++
+			if i < len(runes) && runes[i] == c {
+				op += string(c)
+				i++
+			}
+			if i < len(runes) && runes[i] == '&' {
+				i++
+				target := ""
+				if i < len(runes) && (isDigitRune(runes[i]) || runes[i] == '-') {
+					target = string(runes[i])
+					i++
+				}
+				tokens = append(tokens, prefix+op+"&"+target)
+			} else {
+				tokens = append(tokens, prefix+op)
+			}
+		default:
+			word.WriteRune(c)
+			started = true
+			i++
+		}
+	}
+	flush()
+	return tokens
+}
+
+func isDigitRune(c rune) bool { return c >= '0' && c <= '9' }
+
+func isAllDigits(s string) bool {
+	if s == "" {
+		return false
+	}
+	for _, c := range s {
+		if !isDigitRune(c) {
+			return false
+		}
+	}
+	return true
+}
+
+func isEnvAssignment(word string) bool {
+	eq := strings.Index(word, "=")
+	if eq <= 0 {
+		return false
+	}
+	for _, c := range word[:eq] {
+		if c != '_' && !isDigitRune(c) && (c < 'A' || c > 'Z') && (c < 'a' || c > 'z') {
+			return false
+		}
+	}
+	return true
+}
+
+// shellListNeutralizesFailure reports the fail-open list forms the generic
+// policy rejects on every step: "|| true", "|| :", and "|| exit 0" replace a
+// failing command's status with success.
+func shellListNeutralizesFailure(tokens []string) bool {
+	for i, tok := range tokens {
+		if tok != "||" {
+			continue
+		}
+		if i+1 < len(tokens) && (tokens[i+1] == "true" || tokens[i+1] == ":") {
+			return true
+		}
+		if i+2 < len(tokens) && tokens[i+1] == "exit" && tokens[i+2] == "0" {
+			return true
+		}
+	}
+	return false
+}
+
+// shellDisablesErrexit reports whether a step script turns off errexit with
+// "set +e", a combined "+…e…" flag token, or "set +o errexit". The pinned
+// scripts use the "set -euo pipefail" form, which is unaffected.
+func shellDisablesErrexit(tokens []string) bool {
+	for i, tok := range tokens {
+		if tok != "set" {
+			continue
+		}
+		for j := i + 1; j < len(tokens); j++ {
+			t := tokens[j]
+			if t == "\n" || t == ";" || t == "||" || t == "&&" || t == "|" || t == "&" {
+				break
+			}
+			if !strings.HasPrefix(t, "+") {
+				continue
+			}
+			flags := strings.TrimPrefix(t, "+")
+			if strings.Contains(flags, "e") {
+				return true
+			}
+			if flags == "o" && j+1 < len(tokens) && tokens[j+1] == "errexit" {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+const (
+	fdOnLog = iota
+	fdOnSink
+)
+
+func isRedirectionToken(tok string) bool {
+	if strings.Contains(tok, ">&") || strings.Contains(tok, "<&") {
+		return true
+	}
+	if tok == "&>" || tok == "&>>" {
+		return true
+	}
+	switch strings.TrimLeft(tok, "0123456789") {
+	case ">", ">>", "<", "<<", "<<<":
+		return true
+	}
+	return false
+}
+
+// applyRedirection applies one redirection token to the tracked stdout (fd1)
+// and stderr (fd2) targets. A target is a sink when the stream no longer
+// reaches the step log: a file, /dev/null, or a closed descriptor. Dup
+// operators copy the source descriptor's current target, so the simulation
+// is order-sensitive exactly like the shell: "2>&1 1>/dev/null" leaves stderr
+// on the log but still discards the stdout findings, while a bare "2>&1"
+// keeps both streams on the log. The third result reports whether the next
+// token is the redirection's target word and must be skipped.
+func applyRedirection(tok string, fd1, fd2 int) (int, int, bool) {
+	if idx := strings.Index(tok, ">&"); idx >= 0 {
+		src := 1
+		if n, err := strconv.Atoi(strings.TrimSuffix(tok[:idx], ">")); err == nil {
+			src = n
+		}
+		target := tok[idx+2:]
+		value := fdOnLog
+		switch target {
+		case "-":
+			value = fdOnSink
+		case "1":
+			value = fd1
+		case "2":
+			value = fd2
+		default:
+			return fd1, fd2, false
+		}
+		if src == 2 {
+			fd2 = value
+		} else {
+			fd1 = value
+		}
+		return fd1, fd2, false
+	}
+	if strings.Contains(tok, "<&") {
+		return fd1, fd2, false
+	}
+	if tok == "&>" || tok == "&>>" {
+		return fdOnSink, fdOnSink, true
+	}
+	switch strings.TrimLeft(tok, "0123456789") {
+	case ">", ">>":
+		fd := 1
+		if n, err := strconv.Atoi(strings.TrimRight(tok, ">")); err == nil && n > 0 {
+			fd = n
+		}
+		if fd == 2 {
+			fd2 = fdOnSink
+		} else {
+			fd1 = fdOnSink
+		}
+		return fd1, fd2, true
+	case "<", "<<", "<<<":
+		// Input redirection cannot hide scanner output; skip its target so
+		// it is not mistaken for a command word.
+		return fd1, fd2, true
+	}
+	return fd1, fd2, false
+}
+
+// isShellCommandWord reports whether a word names a shell whose -c form
+// executes a command string: bash, sh, or dash, bare or by path (for
+// example /bin/bash).
+func isShellCommandWord(word string) bool {
+	if idx := strings.LastIndex(word, "/"); idx >= 0 {
+		word = word[idx+1:]
+	}
+	switch word {
+	case "bash", "sh", "dash":
+		return true
+	}
+	return false
+}
+
+// shellWrapperScript returns the command string a shell invocation at
+// tokens[shellIdx] passes to its -c flag, if it has one. The flag may stand
+// alone ("-c"), sit in a combined short-flag token ("-ec", "-ce"), or be
+// glued to the string itself ("-cgovulncheck ...", a spelling the lexer
+// folds into one word token). Other short flags before or around it
+// ("-e", "-x", "-l", "-o errexit") are skipped; the scan stops at the
+// first non-flag word, because a shell whose first argument is a script
+// path is not a -c wrapper.
+func shellWrapperScript(tokens []string, shellIdx int) (string, bool) {
+	for j := shellIdx + 1; j < len(tokens); j++ {
+		tok := tokens[j]
+		switch tok {
+		case "\n", ";", "||", "&&", "|", "&", "(", ")", "$(", "`":
+			return "", false
+		}
+		if !strings.HasPrefix(tok, "-") || tok == "-" || strings.HasPrefix(tok, "--") {
+			return "", false
+		}
+		if tok == "-o" {
+			j++ // skip the option name "-o" takes
+			continue
+		}
+		c := strings.IndexByte(tok[1:], 'c')
+		if c < 0 {
+			continue
+		}
+		if rest := tok[1+c+1:]; rest != "" {
+			return rest, true
+		}
+		if j+1 < len(tokens) {
+			return tokens[j+1], true
+		}
+		return "", false
+	}
+	return "", false
+}
+
+// scriptInvokesScanner reports whether a shell -c command string invokes
+// govulncheck or gitleaks in command position, recursing into nested -c
+// wrappers. Scanner names that appear only as arguments (a tar member, an
+// install path) do not count, matching the outer scan.
+func scriptInvokesScanner(script string) bool {
+	tokens := shellTokens(script)
+	cmdPos := true
+	skipTarget := false
+	for i, tok := range tokens {
+		if skipTarget {
+			skipTarget = false
+			continue
+		}
+		switch {
+		case tok == "\n" || tok == ";" || tok == "||" || tok == "&&" || tok == "|" || tok == "&" || tok == "(" || tok == ")" || tok == "$(" || tok == "`":
+			cmdPos = true
+		case isRedirectionToken(tok):
+			_, _, skipTarget = applyRedirection(tok, fdOnLog, fdOnLog)
+		default:
+			if !cmdPos {
+				continue
+			}
+			switch {
+			case tok == "govulncheck" || tok == "gitleaks":
+				return true
+			case isShellCommandWord(tok):
+				if inner, ok := shellWrapperScript(tokens, i); ok && scriptInvokesScanner(inner) {
+					return true
+				}
+				cmdPos = false
+			case tok == "if" || tok == "while" || tok == "until" || tok == "!" || tok == "exec" || tok == "sudo" || tok == "command" || tok == "then" || tok == "do" || isEnvAssignment(tok):
+				// Still in command position for the next word.
+			default:
+				cmdPos = false
+			}
+		}
+	}
+	return false
+}
+
+// dollarSubstitutionContent returns the command string inside the
+// "$(...)" substitution whose body starts at runes[start], plus the index
+// just past the closing ")". Parentheses nest; quoted spans and backtick
+// substitutions inside the body are skipped as units so a ")" inside them
+// does not close the substitution early. An unterminated substitution
+// reports ok == false (the shell rejects the script, so it cannot run a
+// scanner at all).
+func dollarSubstitutionContent(runes []rune, start int) (content string, end int, ok bool) {
+	depth := 1
+	inSingle, inDouble := false, false
+	i := start
+	for i < len(runes) {
+		c := runes[i]
+		switch {
+		case inSingle:
+			if c == '\'' {
+				inSingle = false
+			}
+			i++
+		case inDouble:
+			if c == '\\' && i+1 < len(runes) {
+				i += 2
+				continue
+			}
+			if c == '"' {
+				inDouble = false
+			}
+			i++
+		case c == '\\' && i+1 < len(runes):
+			i += 2
+		case c == '\'':
+			inSingle = true
+			i++
+		case c == '"':
+			inDouble = true
+			i++
+		case c == '`':
+			_, after, closed := backtickSubstitutionContent(runes, i+1)
+			if !closed {
+				return "", 0, false
+			}
+			i = after
+		case c == '(':
+			depth++
+			i++
+		case c == ')':
+			depth--
+			i++
+			if depth == 0 {
+				return string(runes[start : i-1]), i, true
+			}
+		default:
+			i++
+		}
+	}
+	return "", 0, false
+}
+
+// backtickSubstitutionContent returns the command string inside the
+// backtick substitution whose body starts at runes[start], plus the index
+// just past the closing backtick.
+func backtickSubstitutionContent(runes []rune, start int) (content string, end int, ok bool) {
+	for i := start; i < len(runes); i++ {
+		switch runes[i] {
+		case '\\':
+			i++ // the escaped character cannot close the substitution
+		case '`':
+			return string(runes[start:i]), i + 1, true
+		}
+	}
+	return "", 0, false
+}
+
+// substitutionInvokesScanner reports whether any executed command
+// substitution in command — "$(...)" or backticks, in any position
+// (assignment value, bare command, argument) — invokes govulncheck or
+// gitleaks. This scan runs on the raw script, not on shellTokens output,
+// because the lexer folds a double-quoted span into a single word token:
+// `out="$(govulncheck -test ./... || true)"` produced one assignment token
+// in which neither the substitution, the scanner invocation, nor the
+// "|| true" was visible, while the step still contained the required
+// invocation substring (a review reproduced it exiting 0 under bash -e
+// for a scanner returning 3). Substitution executes inside double quotes
+// exactly as it does unquoted, so the quote tracking here only exempts
+// single-quoted spans, where substitution syntax is literal text that
+// never runs — `echo '$(govulncheck ...)'` prints text, it does not scan.
+// Each substitution body is unwrapped and checked recursively (a body
+// may itself quote or substitute again) with scriptInvokesScanner, the
+// same command-position test the shell -c wrapper check uses.
+// Substitutions that invoke no scanner — the license steps' allowlist
+// computation in security-scans.yml, the only substitutions in that
+// workflow — are out of scope, matching the rest of this scan. The steps
+// that invoke govulncheck or gitleaks in security-scans.yml contain no
+// command substitution at all: those invocations are direct, so no
+// legitimate scanner step loses anything by the capture rejection in
+// scannerShellSuppression.
+func substitutionInvokesScanner(command string) bool {
+	runes := []rune(command)
+	inSingle, inDouble := false, false
+	invokes := func(content string) bool {
+		return scriptInvokesScanner(content) || substitutionInvokesScanner(content)
+	}
+	i := 0
+	for i < len(runes) {
+		c := runes[i]
+		switch {
+		case inSingle:
+			if c == '\'' {
+				inSingle = false
+			}
+			i++
+		case c == '\\' && i+1 < len(runes):
+			// An escaped character starts no substitution and opens or
+			// closes no quote, inside double quotes or out.
+			i += 2
+		case inDouble && c == '"':
+			inDouble = false
+			i++
+		case !inDouble && c == '\'':
+			inSingle = true
+			i++
+		case !inDouble && c == '"':
+			inDouble = true
+			i++
+		case c == '$' && i+1 < len(runes) && runes[i+1] == '(':
+			content, end, ok := dollarSubstitutionContent(runes, i+2)
+			if !ok {
+				i += 2
+				continue
+			}
+			if invokes(content) {
+				return true
+			}
+			i = end
+		case c == '`':
+			content, end, ok := backtickSubstitutionContent(runes, i+1)
+			if !ok {
+				i++
+				continue
+			}
+			if invokes(content) {
+				return true
+			}
+			i = end
+		default:
+			i++
+		}
+	}
+	return false
+}
+
+// scannerShellSuppression inspects a step's run command with the token-aware
+// shell scan and returns a suppression reason when a govulncheck or gitleaks
+// invocation — a scanner word in command position, so scanner names that
+// appear as arguments (a tar member, an install path) do not count — is
+// neutralized or its output hidden:
+//
+//   - any "||" list: the scanner's exit status no longer decides the step;
+//   - a pipe: the step status comes from the downstream command (the pinned
+//     steps do not set an explicit shell, so no pipefail is guaranteed);
+//   - backgrounding with "&": the step never waits for the scanner;
+//   - a condition or negation context ("if", "while", "until", "!"): a
+//     findings status is consumed as a test, not a failure;
+//   - command substitution ("$(...)" or backticks): the output is captured
+//     instead of reaching the step log, and the status is the consumer's.
+//     Detected on the raw script by substitutionInvokesScanner before the
+//     token scan, because a substitution inside double quotes — an
+//     assignment value such as `out="$(govulncheck -test ./... || true)"`,
+//     or an argument — folds into a single lexer word and is invisible to
+//     the token scan below; the unwrapped body is checked recursively to
+//     the same command-position standard. Substitution syntax inside
+//     single quotes is literal text that never executes and is not
+//     flagged, and substitutions invoking no scanner stay out of scope;
+//   - a redirection that sends stdout or stderr to a sink (fd simulation in
+//     applyRedirection; an earlier "exec" redirection persists into the
+//     scanner's segment). govulncheck writes its text findings to stdout
+//     and its errors to stderr; gitleaks writes its findings log to stderr,
+//     so a sink on either stream hides scanner output for one of the tools.
+//   - a shell "-c" wrapper around the invocation ("bash -c '...'",
+//     "sh -c '...'", combined-flag and path spellings included): the
+//     lexer folds the quoted script into a single word token, so neither
+//     this scan nor the list check can see suppression inside it, while
+//     the required invocation substrings in validateScannerSteps still
+//     match — "bash -c 'govulncheck -test ./... || true'" passed the
+//     policy while exiting 0 for a failing scanner. Wrapped scanners are
+//     rejected outright instead of unwrapping and re-validating the
+//     string: the pinned workflow invokes every scanner directly, no
+//     legitimate scanner step needs a -c wrapper, and one flat rule
+//     closes every inner suppression spelling at once. A wrapper whose
+//     script invokes no scanner (a script-file step is not a wrapper at
+//     all) stays out of scope.
+//
+// Bare subshells, "&&" lists, and ";" sequences are not suppression under
+// the pinned default shell (bash -e): their step status still carries the
+// scanner's nonzero status, so they are deliberately not flagged.
+func scannerShellSuppression(command string) string {
+	const redirectReason = "redirects a scanner stream away from the step log"
+	if substitutionInvokesScanner(command) {
+		return "captures the scanner output in a command substitution, away from the step log"
+	}
+	tokens := shellTokens(command)
+	fd1, fd2 := fdOnLog, fdOnLog
+	persist1, persist2 := fdOnLog, fdOnLog
+	scanner := false
+	execSegment := false
+	cmdPos := true
+	condition := false
+	substDepth := 0
+	backtick := false
+	skipTarget := false
+	resetSegment := func() {
+		scanner = false
+		execSegment = false
+		condition = false
+		cmdPos = true
+		fd1, fd2 = persist1, persist2
+	}
+	for tokIdx, tok := range tokens {
+		if skipTarget {
+			skipTarget = false
+			continue
+		}
+		switch {
+		case tok == "\n" || tok == ";":
+			if scanner && (fd1 == fdOnSink || fd2 == fdOnSink) {
+				return redirectReason
+			}
+			if execSegment {
+				persist1, persist2 = fd1, fd2
+			}
+			resetSegment()
+		case tok == "||":
+			if scanner {
+				return "places the scanner invocation in a || list, so its exit status no longer fails the step on its own"
+			}
+			resetSegment()
+		case tok == "&&":
+			if scanner && (fd1 == fdOnSink || fd2 == fdOnSink) {
+				return redirectReason
+			}
+			resetSegment()
+		case tok == "|":
+			if scanner {
+				return "pipes the scanner output, so the step exit status comes from the downstream command instead of the scanner"
+			}
+			resetSegment()
+		case tok == "&":
+			if scanner {
+				return "backgrounds the scanner invocation, so the step does not wait for its exit status"
+			}
+			resetSegment()
+		case tok == "$(":
+			substDepth++
+			cmdPos = true
+		case tok == "`":
+			backtick = !backtick
+			cmdPos = true
+		case tok == "(":
+			cmdPos = true
+		case tok == ")":
+			if scanner && (fd1 == fdOnSink || fd2 == fdOnSink) {
+				return redirectReason
+			}
+			if substDepth > 0 {
+				substDepth--
+			}
+			resetSegment()
+		case isRedirectionToken(tok):
+			fd1, fd2, skipTarget = applyRedirection(tok, fd1, fd2)
+		default: // a word token
+			if !cmdPos {
+				continue
+			}
+			switch {
+			case tok == "if" || tok == "while" || tok == "until" || tok == "!":
+				condition = true
+			case tok == "exec":
+				execSegment = true
+			case tok == "sudo" || tok == "command" || tok == "then" || tok == "do" || isEnvAssignment(tok):
+				// Still in command position for the next word.
+			case isShellCommandWord(tok):
+				if script, ok := shellWrapperScript(tokens, tokIdx); ok && scriptInvokesScanner(script) {
+					return "invokes the scanner through a shell -c wrapper, whose quoted command string escapes the token-aware suppression scan"
+				}
+				cmdPos = false
+			case tok == "govulncheck" || tok == "gitleaks":
+				scanner = true
+				cmdPos = false
+				if condition {
+					return "runs the scanner in a condition or negation context, where a findings exit status does not fail the step"
+				}
+				if substDepth > 0 || backtick {
+					return "captures the scanner output in a command substitution, away from the step log"
+				}
+				if persist1 == fdOnSink || persist2 == fdOnSink {
+					return redirectReason
+				}
+			default:
+				cmdPos = false
+			}
+		}
+	}
+	if scanner && (fd1 == fdOnSink || fd2 == fdOnSink) {
+		return redirectReason
+	}
+	return ""
+}
+
+// pinnedGitleaksValueFlags are the value-carrying flags whose single pinned
+// occurrence the full-history scan contract depends on.
+var pinnedGitleaksValueFlags = []string{"--log-opts", "--config", "--redact", "--gitleaks-ignore-path", "--timeout"}
+
+// duplicatePinnedGitleaksFlag returns the first pinned Gitleaks value flag
+// that occurs more than once in the command (in equals or space form).
+// Gitleaks flag parsing keeps the last occurrence, so a duplicate silently
+// overrides the pinned value even when every required substring is present.
+func duplicatePinnedGitleaksFlag(command string) string {
+	counts := map[string]int{}
+	for _, tok := range shellTokens(command) {
+		for _, flag := range pinnedGitleaksValueFlags {
+			if tok == flag || strings.HasPrefix(tok, flag+"=") {
+				counts[flag]++
+			}
+		}
+	}
+	for _, flag := range pinnedGitleaksValueFlags {
+		if counts[flag] > 1 {
+			return flag
+		}
+	}
+	return ""
+}
+
+func validateScannerSteps(w workflow) error {
+	if len(w.Env) != 0 || w.Defaults != nil {
+		return fmt.Errorf("security workflow must not define root env or defaults")
+	}
+	var toolInstall, govuln, nestedCloudBootstrapGovuln, nestedGovuln, licenses, nestedLicenses, bootstrapLicenses, licenseBehavior, licenseFixture, actionlint, gitleaks, gitleaksInstall, gitleaksSmoke, gitleaksGuard bool
+	for jobName, configured := range w.Jobs {
+		if len(configured.Env) != 0 || configured.Defaults != nil || configured.Container != nil {
+			return fmt.Errorf("job %s must not define env, defaults, or container overrides", jobName)
+		}
+		for _, s := range configured.Steps {
+			if s.Container != nil {
+				return fmt.Errorf("job %s step %q must not define a container override", jobName, s.Name)
+			}
+			if expectedShell, pinned := pinnedScannerStepShell[s.Name]; pinned {
+				if s.Shell != expectedShell || len(s.Env) != 0 {
+					return fmt.Errorf("job %s scanner step %q must keep shell %q with no step-level env", jobName, s.Name, expectedShell)
+				}
+			}
+			command := strings.TrimSpace(s.Run)
+			// Finding-suppression contract, exactly as implemented here and
+			// in scannerShellSuppression (census: docs/security/README.md,
+			// "Scanner suppression census"):
+			//
+			//   - Every step: the scanner-native flags --exit-code and
+			//     --baseline-path are rejected as substrings, in any spelling
+			//     or value, because the flag itself replaces the scanner's
+			//     native finding status; a step must not continue on error,
+			//     disable errexit (set +e / set +o errexit), or neutralize a
+			//     failure with the fail-open list forms "|| true", "|| :",
+			//     or "|| exit 0".
+			//   - Steps that invoke govulncheck or gitleaks: the token-aware
+			//     shell scan additionally rejects any "||" list, pipe,
+			//     backgrounding, condition or negation context, command
+			//     substitution (in any position, quoted or not — a
+			//     double-quoted assignment value folds into one lexer word,
+			//     so executed substitutions are unwrapped and checked on
+			//     the raw script; single-quoted substitution syntax is
+			//     literal and unflagged), any redirection that sends stdout or
+			//     stderr to a file or /dev/null, and a shell "-c" wrapper
+			//     around the invocation (the quoted script is one lexer
+			//     word, so inner suppression would be invisible here while
+			//     the invocation substrings above still match). Dup
+			//     plumbing that keeps both streams on the step log (a bare
+			//     "2>&1") is accepted.
+			//   - The Gitleaks scan step: its pinned value flags must each
+			//     appear exactly once (see the Gitleaks block below), so a
+			//     duplicate flag cannot override a pinned value under
+			//     last-occurrence-wins flag parsing.
+			//
+			// The asymmetry a reviewer flagged — the scanner flag family was
+			// matched whole while the shell side knew only the literal
+			// "|| true" — is resolved by unifying the shell side at the
+			// operator level for scanner invocations instead of enumerating
+			// right-hand spellings: the set of commands that can follow
+			// "||" is open-ended, while each scanner flag is one named
+			// option whose every spelling has the same effect.
+			if strings.Contains(command, "--exit-code") {
+				return fmt.Errorf("job %s scanner step %q must not override the scanner exit code", jobName, s.Name)
+			}
+			if strings.Contains(command, "--baseline-path") {
+				return fmt.Errorf("job %s scanner step %q must not use a baseline that suppresses known findings", jobName, s.Name)
+			}
+			if (jobName == "go-security" || jobName == "secrets") && strings.TrimSpace(s.If) != "" {
+				return fmt.Errorf("job %s scanner step %q must not be conditional", jobName, s.Name)
+			}
+			tokens := shellTokens(command)
+			if shellDisablesErrexit(tokens) {
+				return fmt.Errorf("job %s scanner step %q must not disable errexit", jobName, s.Name)
+			}
+			if s.ContinueOnError || shellListNeutralizesFailure(tokens) {
+				return fmt.Errorf("job %s scanner step %q can hide failure", jobName, s.Name)
+			}
+			if reason := scannerShellSuppression(command); reason != "" {
+				return fmt.Errorf("job %s scanner step %q %s", jobName, s.Name, reason)
+			}
+			if strings.EqualFold(s.Name, "Check vulnerabilities including tests") {
+				govuln = true
+				if !strings.Contains(command, "govulncheck -test ./...") || strings.Contains(command, "-json") || strings.Contains(command, "-format sarif") || strings.Contains(command, "-format openvex") {
+					return fmt.Errorf("govulncheck must scan test dependencies using exit-status text mode")
+				}
+			}
+			if s.Name == "Check nested cloud bootstrap vulnerabilities including tests" {
+				nestedCloudBootstrapGovuln = s.WorkingDirectory == "cmd/cloud-tools-bootstrap" && strings.TrimSpace(command) == "govulncheck -test ./..."
+				if !nestedCloudBootstrapGovuln {
+					return fmt.Errorf("nested cloud bootstrap module must receive a test-inclusive govulncheck scan")
+				}
+			}
+			if s.Name == "Check nested adapter vulnerabilities including tests" {
+				nestedGovuln = s.WorkingDirectory == "ci/pdfua2/adapter" && strings.TrimSpace(command) == "govulncheck -test ./..."
+				if !nestedGovuln {
+					return fmt.Errorf("nested adapter module must receive a test-inclusive govulncheck scan")
+				}
+			}
+			if s.Name == "Install pinned security tools" {
+				required := []string{
+					"golang.org/x/vuln/cmd/govulncheck@v1.9.0",
+					"github.com/google/go-licenses/v2@v2.0.1",
+					"github.com/rhysd/actionlint/cmd/actionlint@v1.7.12",
+				}
+				toolInstall = true
+				for _, pin := range required {
+					if !strings.Contains(command, pin) {
+						toolInstall = false
+						return fmt.Errorf("security tool install must pin %s", pin)
+					}
+				}
+			}
+			if s.Name == "Check test-inclusive dependency licenses" {
+				licenses = command == "bash scripts/check-licenses.sh root"
+				if !licenses {
+					return fmt.Errorf("license check must invoke the pinned license script for the root module")
+				}
+			}
+			if s.Name == "Check nested adapter test-inclusive dependency licenses" {
+				nestedLicenses = s.WorkingDirectory == "ci/pdfua2/adapter" &&
+					command == "bash ../../../scripts/check-licenses.sh adapter"
+				if !nestedLicenses {
+					return fmt.Errorf("nested adapter module must receive its license check through the pinned license script from its module directory")
+				}
+			}
+			if s.Name == "Check cloud bootstrap module license exemption" {
+				bootstrapLicenses = command == "bash scripts/check-licenses.sh bootstrap"
+				if !bootstrapLicenses {
+					return fmt.Errorf("cloud bootstrap module license exemption must invoke the pinned license script")
+				}
+			}
+			if s.Name == "Verify license check script behavior" {
+				licenseBehavior = command == "bash .github/scripts/test-check-licenses.sh"
+				if !licenseBehavior {
+					return fmt.Errorf("license check script behavior must be verified by the pinned behavior test script")
+				}
+			}
+			if s.Name == "Verify license policy rejects a test-only forbidden dependency" {
+				licenseFixture = command == "bash .github/scripts/test-go-licenses.sh"
+				if !licenseFixture {
+					return fmt.Errorf("license policy must test rejection of a forbidden test-only dependency")
+				}
+			}
+			if s.Name == "Lint workflow files" {
+				actionlint = command == "actionlint" && s.WorkingDirectory == ""
+				if !actionlint {
+					return fmt.Errorf("workflow linting must run actionlint directly from the repository root and fail on error")
+				}
+			}
+			if s.Name == "Install pinned Gitleaks" {
+				gitleaksInstall = strings.Contains(command, "gitleaks_8.30.1_linux_x64.tar.gz") &&
+					strings.Contains(command, "551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb") &&
+					strings.Contains(command, "sha256sum --check") &&
+					strings.Contains(command, "set -euo pipefail")
+				if !gitleaksInstall {
+					return fmt.Errorf("Gitleaks must use the pinned v8.30.1 Linux release with SHA-256 verification")
+				}
+			}
+			if s.Name == "Verify Gitleaks clean, finding, and error behavior" {
+				gitleaksSmoke = command == "bash .github/scripts/test-gitleaks.sh"
+				if !gitleaksSmoke {
+					return fmt.Errorf("Gitleaks must run the synthetic suppression and redaction smoke checks")
+				}
+			}
+			if s.Name == "Reject unmanaged Gitleaks config and ignore files" {
+				gitleaksGuard = command == "bash .github/scripts/check-gitleaks-suppressions.sh"
+				if !gitleaksGuard {
+					return fmt.Errorf("Gitleaks must reject unmanaged source-level config and suppression files")
+				}
+			}
+			if strings.Contains(strings.ToLower(s.Name), "gitleaks full-history scan") {
+				gitleaks = true
+				if dup := duplicatePinnedGitleaksFlag(command); dup != "" {
+					return fmt.Errorf("Gitleaks pinned flag %s must appear exactly once, so a duplicate cannot override its pinned value", dup)
+				}
+				if !strings.Contains(command, "gitleaks git") || !strings.Contains(command, "--log-opts=--all") || !strings.Contains(command, "--redact=100") || !strings.Contains(command, "--ignore-gitleaks-allow") || !strings.Contains(command, "--config=.security/gitleaks.toml") || !strings.Contains(command, "--gitleaks-ignore-path=/dev/null") || strings.Contains(command, "--report-path") || strings.Contains(command, "--report-format") || strings.Contains(command, "--exit-code=0") {
+					return fmt.Errorf("Gitleaks must scan all history with full redaction and native finding/error exit status")
+				}
+			}
+		}
+	}
+	if !toolInstall || !govuln || !nestedCloudBootstrapGovuln || !nestedGovuln || !licenses || !nestedLicenses || !bootstrapLicenses || !licenseBehavior || !licenseFixture || !actionlint || !gitleaks || !gitleaksInstall || !gitleaksSmoke || !gitleaksGuard {
+		return fmt.Errorf("pinned Go security tools, root and both nested-module govulncheck, root and nested test-inclusive license checks, bootstrap license exemption, license script behavior verification and negative fixture, actionlint, pinned Gitleaks install, suppression guard and smoke, and full-history scan steps are required")
+	}
+	return nil
+}
+
+// requiredGoChecksSteps is the one ordered inventory for the Go checks job.
+// It pins the existing module gates together with the non-gate actions and
+// setup commands, so the validator has no second list to drift from. Keep it
+// in lockstep with .github/workflows/go-checks.yml.
+type goChecksStepSpec struct {
+	name             string
+	uses             string
+	run              string
+	workingDirectory string
+	with             map[string]any
+	env              map[string]string
+	moduleGate       bool
+}
+
+var requiredGoChecksSteps = []goChecksStepSpec{
+	{name: "Check out repository", uses: "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1", with: map[string]any{"persist-credentials": false, "fetch-depth": 0}},
+	{name: "Set up Go", uses: "actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e", with: map[string]any{"go-version-file": "go.mod"}},
+	{name: "Keep pdfcpu out of the financial fixtures CLI dependency graph", run: `set -euo pipefail
+dependency_graph="$(mktemp)"
+trap 'rm -f "$dependency_graph"' EXIT
+if ! go list -deps ./cmd/financial-fixtures-v2 >"$dependency_graph"; then
+  echo "go list dependency scan failed; cannot verify pdfcpu is test-only" >&2
+  exit 1
+fi
+if grep -q '^github.com/pdfcpu/' "$dependency_graph"; then
+  echo "pdfcpu must remain test-only, outside the financial fixtures CLI dependency graph" >&2
+  exit 1
+else
+  grep_status=$?
+  if [ "$grep_status" -ne 1 ]; then
+    echo "dependency graph search failed with status $grep_status" >&2
+    exit 1
+  fi
+fi
+`},
+	{name: "Test pinned Poppler acquisition provenance", run: "bash .github/scripts/test-pinned-poppler-install.sh"},
+	{name: "Install poppler-utils", run: "bash .github/scripts/install-pinned-poppler.sh"},
+	{name: "Check formatting", run: `test -z "$(gofmt -l .)"`},
+	{name: "Validate profile schemas with Draft 2020-12 behavior cases", run: "node scripts/test-profile-schema-regex.cjs && python3 -m pip install --disable-pip-version-check --requirement scripts/profile-schema-test-requirements.txt && python3 scripts/test-profile-schemas.py"},
+	{name: "Test source publisher guard", run: "bash -n scripts/source-publisher.sh .github/scripts/test-source-publisher.sh && bash .github/scripts/test-source-publisher.sh"},
+	{name: "Check module files", run: "go mod tidy -diff", moduleGate: true},
+	{name: "Check traceability catalog", run: "go run ./cmd/traceability-check", moduleGate: true},
+	{name: "Vet", run: "go vet ./...", moduleGate: true},
+	{name: "Install pinned Beads for gated contract tests", run: `set -euo pipefail
+tool_dir="$RUNNER_TEMP/beads-1.3.1"
+mkdir -p "$tool_dir"
+curl --proto '=https' --fail --location --silent --show-error \
+  https://github.com/gastownhall/beads/releases/download/v1.3.1/beads_1.3.1_linux_amd64.tar.gz \
+  --output "$tool_dir/beads_1.3.1_linux_amd64.tar.gz"
+tar --no-same-owner -xzf "$tool_dir/beads_1.3.1_linux_amd64.tar.gz" -C "$tool_dir" bd
+echo "` + testPinnedBDDigest + `  $tool_dir/bd" | sha256sum --check
+`},
+	{name: "Test with race detector", run: "go test -race ./...", env: map[string]string{"DAP_BEADS_SOURCE_REF": "${{ github.event.pull_request.base.sha || github.event.before }}", "DAP_BD_BINARY": "${{ runner.temp }}/beads-1.3.1/bd"}, moduleGate: true},
+	{name: "Test standalone cloud bootstrap module", run: "go test -race ./...", workingDirectory: "cmd/cloud-tools-bootstrap", moduleGate: true},
+	{name: "Vet standalone cloud bootstrap module", run: "go vet ./...", workingDirectory: "cmd/cloud-tools-bootstrap", moduleGate: true},
+	{name: "Test PDF/UA-2 adapter module", run: "env PDFUA_REAL_CLI_JAR= go test -race ./... -count=1", workingDirectory: "ci/pdfua2/adapter", moduleGate: true},
+	{name: "Vet PDF/UA-2 adapter module", run: "go vet ./...", workingDirectory: "ci/pdfua2/adapter", moduleGate: true},
+	{name: "Check adapter module files", run: "go mod tidy -diff", workingDirectory: "ci/pdfua2/adapter", moduleGate: true},
+	{name: "Check cloud bootstrap module files", run: "go mod tidy -diff", workingDirectory: "cmd/cloud-tools-bootstrap", moduleGate: true},
+	{name: "Check cloud bootstrap shell syntax", run: "bash -n scripts/bootstrap-cloud-build-tools.sh"},
+}
+
+// jobNeedsAnything reports whether a `needs:` value parsed as `any` names at
+// least one job. Non-strict yaml.Unmarshal keeps `needs` silent on the job
+// struct; anything non-empty gates the job on skipped work, so an unknown
+// shape fails closed.
+func jobNeedsAnything(needs any) bool {
+	switch v := needs.(type) {
+	case nil:
+		return false
+	case string:
+		return strings.TrimSpace(v) != ""
+	case []any:
+		for _, item := range v {
+			if strings.TrimSpace(fmt.Sprint(item)) != "" {
+				return true
+			}
+		}
+		return false
+	default:
+		return true
+	}
+}
+
+func validateScannerIsolation(security, project workflow) error {
+	scannerJob, ok := security.Jobs["go-security"]
+	if !ok {
+		return fmt.Errorf("required go-security scanner context is missing")
+	}
+	if err := validateGoChecksPullRequestTrigger(project.On); err != nil {
+		return err
+	}
+	projectJob, ok := project.Jobs["checks"]
+	if !ok {
+		return fmt.Errorf("project tests must remain in the Go checks job")
+	}
+	if err := validateRunnerLabels(project); err != nil {
+		return err
+	}
+	if projectJob.RunsOn != "ubuntu-24.04" {
+		return fmt.Errorf("Go checks must run on ubuntu-24.04 to match the pinned Noble Poppler package, found %q", projectJob.RunsOn)
+	}
+	if strings.TrimSpace(projectJob.If) != "" || projectJob.ContinueOnError {
+		return fmt.Errorf("project job %q must be unconditional and fail closed", "checks")
+	}
+	if jobNeedsAnything(projectJob.Needs) {
+		return fmt.Errorf("project job %q must not wait on other jobs via needs", "checks")
+	}
+	if len(project.Permissions) != 1 || project.Permissions["contents"] != "read" {
+		return fmt.Errorf("workflow %q permissions must be exactly contents: read", project.Name)
+	}
+	if len(project.Env) != 0 {
+		return fmt.Errorf("workflow %q must not set top-level env", project.Name)
+	}
+	if project.Defaults != nil {
+		return fmt.Errorf("workflow %q must not set top-level defaults", project.Name)
+	}
+	if len(projectJob.Permissions) != 0 {
+		return fmt.Errorf("project job %q must not set job-level permissions", "checks")
+	}
+	if len(projectJob.Env) != 0 {
+		return fmt.Errorf("project job %q must not set job-level env", "checks")
+	}
+	if projectJob.Defaults != nil {
+		return fmt.Errorf("project job %q must not set defaults", "checks")
+	}
+	if projectJob.Container != nil {
+		return fmt.Errorf("project job %q must not run in a container", "checks")
+	}
+	for i, candidate := range projectJob.Steps {
+		stepLabel := strings.TrimSpace(candidate.Name)
+		if stepLabel == "" {
+			stepLabel = fmt.Sprintf("at position %d", i+1)
+		}
+		if strings.TrimSpace(candidate.If) != "" {
+			return fmt.Errorf("project step %s must not be conditional", stepLabel)
+		}
+		if candidate.ContinueOnError {
+			return fmt.Errorf("project step %s must not continue after failure", stepLabel)
+		}
+		if candidate.Container != nil {
+			return fmt.Errorf("project step %q must not run in a container", candidate.Name)
+		}
+	}
+	for _, candidate := range scannerJob.Steps {
+		fields := strings.Fields(candidate.Run)
+		for i := 0; i+1 < len(fields); i++ {
+			if fields[i] == "go" && (fields[i+1] == "test" || fields[i+1] == "vet" || fields[i+1] == "run") {
+				return fmt.Errorf("go-security step %q executes project Go code; keep tests in the separate Go checks workflow", candidate.Name)
+			}
+		}
+	}
+	var setup step
+	setupFound := false
+	for _, candidate := range scannerJob.Steps {
+		if candidate.Name == "Set up Go" {
+			setup = candidate
+			setupFound = true
+			break
+		}
+	}
+	if !setupFound || setup.With["cache"] != false {
+		return fmt.Errorf("go-security must not restore or save a Go build cache shared with PR-controlled tests")
+	}
+	var install step
+	installFound := false
+	for _, candidate := range scannerJob.Steps {
+		if candidate.Name == "Install pinned security tools" {
+			install = candidate
+			installFound = true
+			break
+		}
+	}
+	if !installFound ||
+		!strings.Contains(install.Run, "tool_dir=\"$RUNNER_TEMP/security-tools\"") ||
+		!strings.Contains(install.Run, "GOBIN=\"$tool_dir\" go install golang.org/x/vuln/cmd/govulncheck@v1.9.0") ||
+		!strings.Contains(install.Run, "GOBIN=\"$tool_dir\" go install github.com/google/go-licenses/v2@v2.0.1") ||
+		!strings.Contains(install.Run, "GOBIN=\"$tool_dir\" go install github.com/rhysd/actionlint/cmd/actionlint@v1.7.12") ||
+		!strings.Contains(install.Run, "echo \"$tool_dir\" >> \"$GITHUB_PATH\"") {
+		return fmt.Errorf("pinned scanners must install into a private RUNNER_TEMP directory and add only that directory to PATH")
+	}
+	for _, required := range requiredGoChecksSteps {
+		if !hasGoChecksStep(projectJob.Steps, required) {
+			return fmt.Errorf("separate Go checks job must keep %q running %q", required.name, required.run)
+		}
+	}
+	if len(projectJob.Steps) != len(requiredGoChecksSteps) {
+		return fmt.Errorf("Go checks job must have exactly %d steps, found %d", len(requiredGoChecksSteps), len(projectJob.Steps))
+	}
+	for i, required := range requiredGoChecksSteps {
+		candidate := projectJob.Steps[i]
+		if !goChecksStepMatches(candidate, required) {
+			return fmt.Errorf("Go checks step %d must preserve %q running %q with its pinned action inputs and working directory; found %q", i+1, required.name, required.run, candidate.Name)
+		}
+		if candidate.Shell != "" {
+			return fmt.Errorf("project step %q must not set shell", required.name)
+		}
+	}
+	return nil
+}
+
+func hasGoChecksStep(steps []step, expected goChecksStepSpec) bool {
+	for _, candidate := range steps {
+		if goChecksStepMatches(candidate, expected) {
+			return true
+		}
+	}
+	return false
+}
+
+func goChecksStepMatches(candidate step, expected goChecksStepSpec) bool {
+	return candidate.Name == expected.name &&
+		candidate.Uses == expected.uses &&
+		candidate.Run == expected.run &&
+		candidate.WorkingDirectory == expected.workingDirectory &&
+		reflect.DeepEqual(candidate.With, expected.with) &&
+		reflect.DeepEqual(candidate.Env, expected.env)
+}
+
+func validateGoChecksPullRequestTrigger(events map[string]any) error {
+	if _, ok := events["pull_request_target"]; ok {
+		return fmt.Errorf("Go checks workflow must not use pull_request_target")
+	}
+	trigger, ok := events["pull_request"].(map[string]any)
+	if !ok {
+		return fmt.Errorf("Go checks workflow must use the pull_request trigger")
+	}
+	if len(trigger) != 1 {
+		return fmt.Errorf("Go checks pull_request trigger must not narrow activity types or changed paths")
+	}
+	branches, ok := trigger["branches"].([]any)
+	if !ok || len(branches) != 1 || branches[0] != "main" {
+		return fmt.Errorf("Go checks pull_request trigger must target only main")
+	}
+	return nil
+}
+
+func validateGitleaksConfig(data []byte) error {
+	const approved = "title = \"Repository secret scanning defaults\"\n\n[extend]\nuseDefault = true\n"
+	if string(data) != approved {
+		return fmt.Errorf("Gitleaks config must extend defaults without adding suppressions or custom rules")
+	}
+	return nil
+}
+
+func validateExceptions(config exceptionFile, now time.Time) error {
+	if config.Version != 1 {
+		return fmt.Errorf("exception config version must be 1")
+	}
+	seen := map[string]bool{}
+	for _, e := range config.Exceptions {
+		if strings.TrimSpace(e.ID) == "" || seen[e.ID] {
+			return fmt.Errorf("exception IDs must be non-empty and unique")
+		}
+		seen[e.ID] = true
+		if len(e.Paths) == 0 || len(e.Rules) == 0 || strings.TrimSpace(e.Reason) == "" {
+			return fmt.Errorf("exception %s requires path, rule, and reason", e.ID)
+		}
+		for _, p := range e.Paths {
+			clean := filepath.ToSlash(filepath.Clean(p))
+			if clean != p || strings.ContainsAny(p, "*?[]") || !strings.HasPrefix(p, "internal/devsecops/testdata/gitleaks/") {
+				return fmt.Errorf("exception %s path must name one synthetic scanner fixture", e.ID)
+			}
+		}
+		for _, rule := range e.Rules {
+			if strings.TrimSpace(rule) == "" {
+				return fmt.Errorf("exception %s has an empty rule id", e.ID)
+			}
+		}
+		if !ownerPattern.MatchString(e.Owner) {
+			return fmt.Errorf("exception %s requires an owner", e.ID)
+		}
+		if !beadsIDPattern.MatchString(e.BeadsID) {
+			return fmt.Errorf("exception %s requires a Beads issue id", e.ID)
+		}
+		expires, err := time.Parse("2006-01-02", e.Expires)
+		if err != nil || !expires.After(now) {
+			return fmt.Errorf("exception %s requires a future YYYY-MM-DD expiry", e.ID)
+		}
+	}
+	return nil
+}
+
+func findStep(t *testing.T, w workflow, name string) step {
+	t.Helper()
+	for _, configured := range w.Jobs {
+		for _, s := range configured.Steps {
+			if s.Name == name {
+				return s
+			}
+		}
+	}
+	t.Fatalf("step %q not found", name)
+	return step{}
+}
+
+func mutateRun(w *workflow, name string, mutate func(*step)) {
+	for jobName, configured := range w.Jobs {
+		for i := range configured.Steps {
+			if configured.Steps[i].Name == name {
+				mutate(&configured.Steps[i])
+				w.Jobs[jobName] = configured
+				return
+			}
+		}
+	}
+	panic("scanner step not found: " + name)
+}
+
+func mutateUse(w *workflow, name, value string) {
+	for jobName, configured := range w.Jobs {
+		for i := range configured.Steps {
+			if configured.Steps[i].Name == name {
+				configured.Steps[i].Uses = value
+				w.Jobs[jobName] = configured
+				return
+			}
+		}
+	}
+	panic("step not found: " + name)
+}
+
+func cloneJobs(source map[string]job) map[string]job {
+	clone := make(map[string]job, len(source))
+	for name, configured := range source {
+		configured.Steps = append([]step(nil), configured.Steps...)
+		for i := range configured.Steps {
+			if configured.Steps[i].With != nil {
+				with := make(map[string]any, len(configured.Steps[i].With))
+				for key, value := range configured.Steps[i].With {
+					with[key] = value
+				}
+				configured.Steps[i].With = with
+			}
+			if configured.Steps[i].Env != nil {
+				env := make(map[string]string, len(configured.Steps[i].Env))
+				for key, value := range configured.Steps[i].Env {
+					env[key] = value
+				}
+				configured.Steps[i].Env = env
+			}
+		}
+		clone[name] = configured
+	}
+	return clone
+}
+
+func cloneEvents(source map[string]any) map[string]any {
+	clone := make(map[string]any, len(source))
+	for name, value := range source {
+		switch event := value.(type) {
+		case map[string]any:
+			copy := make(map[string]any, len(event))
+			for key, setting := range event {
+				if values, ok := setting.([]any); ok {
+					copy[key] = append([]any(nil), values...)
+				} else {
+					copy[key] = setting
+				}
+			}
+			clone[name] = copy
+		case []any:
+			copy := make([]any, len(event))
+			for i, item := range event {
+				if config, ok := item.(map[string]any); ok {
+					configCopy := make(map[string]any, len(config))
+					for key, setting := range config {
+						configCopy[key] = setting
+					}
+					copy[i] = configCopy
+				} else {
+					copy[i] = item
+				}
+			}
+			clone[name] = copy
+		default:
+			clone[name] = value
+		}
+	}
+	return clone
+}
+
+func envWithOverrides(overrides map[string]string) []string {
+	env := make([]string, 0, len(os.Environ())+len(overrides))
+	for _, entry := range os.Environ() {
+		key, _, _ := strings.Cut(entry, "=")
+		if _, replaced := overrides[key]; !replaced {
+			env = append(env, entry)
+		}
+	}
+	for key, value := range overrides {
+		env = append(env, key+"="+value)
+	}
+	return env
+}
+
+func TestValidatorEvidenceRetentionFloor(t *testing.T) {
+	w, _ := readWorkflow(t, "verapdf-integration.yml")
+	const floor = 90
+	found := false
+	for jobName, j := range w.Jobs {
+		for _, s := range j.Steps {
+			name, _ := s.With["name"].(string)
+			if name != "pdfua2-reports" || !strings.HasPrefix(s.Uses, "actions/upload-artifact@") {
+				continue
+			}
+			found = true
+			raw, ok := s.With["retention-days"]
+			if !ok {
+				t.Errorf("job %s: pdfua2-reports artifact step is missing retention-days", jobName)
+				continue
+			}
+			var days int
+			switch v := raw.(type) {
+			case int:
+				days = v
+			case string:
+				n, err := strconv.Atoi(strings.TrimSpace(v))
+				if err != nil {
+					t.Errorf("job %s: pdfua2-reports retention-days %q is not a number", jobName, v)
+					continue
+				}
+				days = n
+			default:
+				t.Errorf("job %s: pdfua2-reports retention-days has unexpected type %T", jobName, raw)
+				continue
+			}
+			if days < floor {
+				t.Errorf("job %s: pdfua2-reports retention-days = %d, want >= %d (evidence must outlast the release-gate review window)", jobName, days, floor)
+			}
+		}
+	}
+	if !found {
+		t.Error("no pdfua2-reports artifact upload step found in verapdf-integration.yml")
+	}
+}
+
+// TestParseGoChecksWorkflowRejectsCaseVariantStructuralKeys verifies that
+// workflow syntax keys retain their exact spelling through the strict parser.
+// The selected inputs are compared with pinned actionlint 1.7.12, which rejects
+// the same case-variant spellings as invalid workflow syntax.
+func TestParseGoChecksWorkflowRejectsCaseVariantStructuralKeys(t *testing.T) {
+	_, raw := readWorkflow(t, "go-checks.yml")
+	cases := []struct {
+		name   string
+		mutate func(string) string
+		key    string
+	}{
+		{
+			name:   "run field spelling is exact",
+			mutate: func(s string) string { return strings.Replace(s, "        run:", "        ruN:", 1) },
+			key:    "ruN",
+		},
+		{
+			name:   "workflow permissions spelling is exact",
+			mutate: func(s string) string { return strings.Replace(s, "permissions:\n", "PERMISSIONS:\n", 1) },
+			key:    "PERMISSIONS",
+		},
+		{
+			name: "workflow env spelling is exact",
+			mutate: func(s string) string {
+				anchor := "permissions:\n  contents: read\n"
+				return strings.Replace(s, anchor, anchor+"\nENV:\n  GOFLAGS: -run=^$\n", 1)
+			},
+			key: "ENV",
+		},
+		{
+			name: "workflow defaults spelling is exact",
+			mutate: func(s string) string {
+				anchor := "permissions:\n  contents: read\n"
+				return strings.Replace(s, anchor, anchor+"\nDEFAULTS:\n  run:\n    shell: sh\n", 1)
+			},
+			key: "DEFAULTS",
+		},
+		{
+			name: "job if spelling is exact",
+			mutate: func(s string) string {
+				anchor := "  checks:\n    runs-on: ubuntu-24.04\n    timeout-minutes: 20\n"
+				return strings.Replace(s, anchor, anchor+"    IF: ${{ false }}\n", 1)
+			},
+			key: "IF",
+		},
+		{
+			name: "job needs spelling is exact",
+			mutate: func(s string) string {
+				anchor := "  checks:\n    runs-on: ubuntu-24.04\n    timeout-minutes: 20\n"
+				return strings.Replace(s, anchor, anchor+"    NEEDS: [precheck]\n", 1)
+			},
+			key: "NEEDS",
+		},
+		{
+			name: "job container spelling is exact",
+			mutate: func(s string) string {
+				anchor := "  checks:\n    runs-on: ubuntu-24.04\n    timeout-minutes: 20\n"
+				return strings.Replace(s, anchor, anchor+"    Container:\n      image: ghcr.io/attacker/runner:latest\n", 1)
+			},
+			key: "Container",
+		},
+		{
+			name: "job env spelling is exact",
+			mutate: func(s string) string {
+				anchor := "  checks:\n    runs-on: ubuntu-24.04\n    timeout-minutes: 20\n"
+				return strings.Replace(s, anchor, anchor+"    Env:\n      GOFLAGS: -run=^$\n", 1)
+			},
+			key: "Env",
+		},
+		{
+			name: "job permissions spelling is exact",
+			mutate: func(s string) string {
+				anchor := "  checks:\n    runs-on: ubuntu-24.04\n    timeout-minutes: 20\n"
+				return strings.Replace(s, anchor, anchor+"    PERMISSIONS:\n      contents: write\n", 1)
+			},
+			key: "PERMISSIONS",
+		},
+		{
+			name: "step if spelling is exact",
+			mutate: func(s string) string {
+				anchor := "      - name: Test with race detector\n"
+				return strings.Replace(s, anchor, anchor+"        If: ${{ false }}\n", 1)
+			},
+			key: "If",
+		},
+		{
+			name: "step continue-on-error spelling is exact",
+			mutate: func(s string) string {
+				anchor := "      - name: Test with race detector\n"
+				return strings.Replace(s, anchor, anchor+"        Continue-On-Error: true\n", 1)
+			},
+			key: "Continue-On-Error",
+		},
+		{
+			name: "step env spelling is exact",
+			mutate: func(s string) string {
+				anchor := "      - name: Test with race detector\n"
+				return strings.Replace(s, anchor, anchor+"        Env:\n          GOTOOLCHAIN: local\n", 1)
+			},
+			key: "Env",
+		},
+		{
+			name: "step container spelling is exact",
+			mutate: func(s string) string {
+				anchor := "      - name: Test with race detector\n"
+				return strings.Replace(s, anchor, anchor+"        Container: ghcr.io/attacker/runner:latest\n", 1)
+			},
+			key: "Container",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			mutated := tc.mutate(raw)
+			if mutated == raw {
+				t.Fatal("mutation anchor not found")
+			}
+			if _, err := parseGoChecksWorkflow([]byte(mutated)); err == nil || !strings.Contains(err.Error(), tc.key) {
+				t.Fatalf("parseGoChecksWorkflow error = %v, want error naming %q", err, tc.key)
+			}
+		})
+	}
+}
+
+func TestParseGoChecksWorkflowRejectsUnknownFieldsAtEachLevel(t *testing.T) {
+	_, raw := readWorkflow(t, "go-checks.yml")
+	cases := []struct {
+		name   string
+		mutate func(string) string
+		field  string
+	}{
+		{
+			name: "workflow field",
+			mutate: func(s string) string {
+				return strings.Replace(s, "name: Go checks\n", "name: Go checks\nunmodeled_workflow_field: true\n", 1)
+			},
+			field: "unmodeled_workflow_field",
+		},
+		{
+			name: "job field",
+			mutate: func(s string) string {
+				anchor := "  checks:\n    runs-on: ubuntu-24.04\n"
+				return strings.Replace(s, anchor, anchor+"    unmodeled_job_field: true\n", 1)
+			},
+			field: "unmodeled_job_field",
+		},
+		{
+			name: "step field",
+			mutate: func(s string) string {
+				anchor := "      - name: Test with race detector\n"
+				return strings.Replace(s, anchor, anchor+"        unmodeled_step_field: true\n", 1)
+			},
+			field: "unmodeled_step_field",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			mutated := tc.mutate(raw)
+			if mutated == raw {
+				t.Fatal("mutation anchor not found")
+			}
+			if _, err := parseGoChecksWorkflow([]byte(mutated)); err == nil || !strings.Contains(err.Error(), tc.field) {
+				t.Fatalf("parseGoChecksWorkflow error = %v, want error naming %q", err, tc.field)
+			}
+		})
+	}
+}
+
+func TestGoChecksPermissionResourceNamesRemainCaseSensitive(t *testing.T) {
+	security, _ := readWorkflow(t, "security-scans.yml")
+	project, raw := readWorkflow(t, "go-checks.yml")
+	if err := validateScannerIsolation(security, project); err != nil {
+		t.Fatalf("unmutated go-checks.yml must be accepted, got: %v", err)
+	}
+
+	const topAnchor = "permissions:\n  contents: read\n"
+	cases := []struct {
+		name   string
+		mutate func(string) string
+		wantIn string
+	}{
+		{
+			name:   "workflow-level permission write is rejected",
+			mutate: func(s string) string { return strings.Replace(s, topAnchor, "permissions:\n  contents: write\n", 1) },
+			wantIn: "Go checks",
+		},
+		{
+			name: "job-level permission write is rejected",
+			mutate: func(s string) string {
+				anchor := "  checks:\n    runs-on: ubuntu-24.04\n"
+				return strings.Replace(s, anchor, anchor+"    permissions:\n      contents: write\n", 1)
+			},
+			wantIn: "checks",
+		},
+		{
+			name:   "workflow-level permission resource names remain exact",
+			mutate: func(s string) string { return strings.Replace(s, topAnchor, "permissions:\n  CONTENTS: read\n", 1) },
+			wantIn: "Go checks",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			mutated := tc.mutate(raw)
+			candidate, err := parseGoChecksWorkflow([]byte(mutated))
+			if err != nil {
+				t.Fatalf("strict parser rejected modeled permission data: %v", err)
+			}
+			err = validateScannerIsolation(security, candidate)
+			if err == nil || !strings.Contains(err.Error(), tc.wantIn) {
+				t.Fatalf("policy validation error = %v, want rejection naming %q", err, tc.wantIn)
+			}
+		})
+	}
+}
+
+func TestGoChecksWorkflowRequiresSafePullRequestTrigger(t *testing.T) {
+	security, _ := readWorkflow(t, "security-scans.yml")
+	_, raw := readWorkflow(t, "go-checks.yml")
+	const trigger = "  pull_request:\n    branches: [main]\n"
+	mutations := []struct {
+		name   string
+		mutate func(string) string
+	}{
+		{
+			name: "missing pull request trigger",
+			mutate: func(s string) string {
+				return strings.Replace(s, trigger, "", 1)
+			},
+		},
+		{
+			name: "pull request target instead of pull request",
+			mutate: func(s string) string {
+				return strings.Replace(s, trigger, "  pull_request_target:\n    branches: [main]\n", 1)
+			},
+		},
+		{
+			name: "pull request target added alongside pull request",
+			mutate: func(s string) string {
+				return strings.Replace(s, trigger, trigger+"  pull_request_target:\n    branches: [main]\n", 1)
+			},
+		},
+		{
+			name: "pull request trigger targets another branch",
+			mutate: func(s string) string {
+				return strings.Replace(s, trigger, "  pull_request:\n    branches: [release]\n", 1)
+			},
+		},
+		{
+			name: "closed-only activity filter suppresses updates",
+			mutate: func(s string) string {
+				return strings.Replace(s, trigger, "  pull_request:\n    types: [closed]\n    branches: [main]\n", 1)
+			},
+		},
+		{
+			name: "path filter suppresses unrelated code changes",
+			mutate: func(s string) string {
+				return strings.Replace(s, trigger, "  pull_request:\n    paths: [docs/**]\n    branches: [main]\n", 1)
+			},
+		},
+		{
+			name: "path ignore suppresses all changes",
+			mutate: func(s string) string {
+				return strings.Replace(s, trigger, "  pull_request:\n    paths-ignore: [\"**\"]\n    branches: [main]\n", 1)
+			},
+		},
+	}
+	for _, tc := range mutations {
+		t.Run(tc.name, func(t *testing.T) {
+			mutated := tc.mutate(raw)
+			if mutated == raw {
+				t.Fatal("trigger mutation anchor not found")
+			}
+			project, err := parseGoChecksWorkflow([]byte(mutated))
+			if err != nil {
+				t.Fatalf("parse mutated workflow: %v", err)
+			}
+			if err := validateScannerIsolation(security, project); err == nil {
+				t.Fatal("workflow with an unsafe or missing pull request trigger was accepted")
+			}
+		})
+	}
+}

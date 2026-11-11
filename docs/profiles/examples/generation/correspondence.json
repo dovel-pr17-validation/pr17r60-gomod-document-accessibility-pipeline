@@ -1,0 +1,67 @@
+{
+  "schema_version": "1.1",
+  "status": "proposed",
+  "lane": "generation",
+  "family": "correspondence",
+  "language": {
+    "value": "en",
+    "status": "open"
+  },
+  "confidentiality": {
+    "value": "synthetic example only; production classification open",
+    "status": "open"
+  },
+  "retention": {
+    "value": "policy and retention period open",
+    "status": "open"
+  },
+  "accessibility": {
+    "value": "PDF/UA-2 is the accepted target; semantic conformance and human review remain separately required",
+    "status": "open"
+  },
+  "human_review": {
+    "value": "semantic and assistive-technology protocol and authority open",
+    "status": "open"
+  },
+  "source_fields": [
+    {
+      "name": "title",
+      "type": "string",
+      "status": "proposed"
+    },
+    {
+      "name": "body",
+      "type": "unknown",
+      "status": "proposed"
+    },
+    {
+      "name": "language",
+      "type": "string",
+      "status": "proposed"
+    },
+    {
+      "name": "recipient",
+      "type": "string",
+      "status": "proposed"
+    },
+    {
+      "name": "date",
+      "type": "date",
+      "status": "open"
+    },
+    {
+      "name": "sender",
+      "type": "string",
+      "status": "open"
+    },
+    {
+      "name": "signature_block",
+      "type": "string",
+      "status": "open"
+    }
+  ],
+  "pdfua_target": {
+    "value": "PDF/UA-2",
+    "status": "accepted"
+  }
+}
